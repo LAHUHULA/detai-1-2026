@@ -7,6 +7,9 @@ from flwr.clientapp import ClientApp
 from ddos_attack.task import build_model, get_num_features_classes, load_data, get_class_weight_criterion
 from ddos_attack.task import test as test_fn
 from ddos_attack.task import train as train_fn
+import time
+from ddos_attack.bench_pi import get_cpu_ram_percent, _try_read_pi_temp_c, get_net_bytes, log_round
+
 
 # Flower ClientApp
 app = ClientApp()
@@ -17,10 +20,10 @@ def train(msg: Message, context: Context):
     """Train the model on local data."""
 
     # Run config
-    model_name = context.run_config.get("model-name", "mlp")
-    partition_mode = context.run_config.get("partition-mode", "iid")
-    dirichlet_alpha = float(context.run_config.get("dirichlet-alpha", 0.5))
-    batch_size = int(context.run_config.get("batch-size", 256))
+    model_name = context.run_config.get("model_name", "mlp")
+    partition_mode = context.run_config.get("partition_mode", "iid")
+    dirichlet_alpha = float(context.run_config.get("dirichlet_alpha", 0.5))
+    batch_size = int(context.run_config.get("batch_size", 256))
 
     # Load model
     num_features, num_classes = get_num_features_classes()
@@ -44,14 +47,45 @@ def train(msg: Message, context: Context):
         dirichlet_alpha=dirichlet_alpha,
     )
 
+    t0 = time.perf_counter()
+    cpu0, ram0 = get_cpu_ram_percent()
+    temp0 = _try_read_pi_temp_c()
+    tx0, rx0 = get_net_bytes()
+
     # Train local
     train_loss = train_fn(
         model,
         trainloader,
-        context.run_config["local-epochs"],
+        context.run_config["local_epochs"],
         msg.content["config"]["lr"],
         device,
     )
+
+        # --- benchmark after ---
+    t1 = time.perf_counter()
+    cpu1, ram1 = get_cpu_ram_percent()
+    temp1 = _try_read_pi_temp_c()
+    tx1, rx1 = get_net_bytes()
+
+    log_round({
+        "ts": time.time(),
+        "client_id": int(context.node_config["partition-id"]),
+        "mode": context.run_config.get("partition_mode", "iid"),
+        "alpha": float(context.run_config.get("dirichlet_alpha", 0.5)),
+        "model": context.run_config.get("model_name", "mlp"),
+        "local_epochs": int(context.run_config["local_epochs"]),
+        "batch_size": int(context.run_config.get("batch_size", 256)),
+        "local_samples": int(len(trainloader.dataset)),
+        "train_time_s": float(t1 - t0),
+        "cpu_percent_before": cpu0,
+        "ram_percent_before": ram0,
+        "temp_c_before": temp0,
+        "cpu_percent_after": cpu1,
+        "ram_percent_after": ram1,
+        "temp_c_after": temp1,
+        "net_tx_bytes_delta": (tx1 - tx0) if (tx0 >= 0 and tx1 >= 0) else None,
+        "net_rx_bytes_delta": (rx1 - rx0) if (rx0 >= 0 and rx1 >= 0) else None,
+    })
 
     # Reply
     model_record = ArrayRecord(model.state_dict())
@@ -69,10 +103,10 @@ def evaluate(msg: Message, context: Context):
     """Evaluate the model on local data."""
 
     # Run config
-    model_name = context.run_config.get("model-name", "mlp")
-    partition_mode = context.run_config.get("partition-mode", "iid")
-    dirichlet_alpha = float(context.run_config.get("dirichlet-alpha", 0.5))
-    batch_size = int(context.run_config.get("batch-size", 256))
+    model_name = context.run_config.get("model_name", "mlp")
+    partition_mode = context.run_config.get("partition_mode", "iid")
+    dirichlet_alpha = float(context.run_config.get("dirichlet_alpha", 0.5))
+    batch_size = int(context.run_config.get("batch_size", 256))
 
     # Load model
     num_features, num_classes = get_num_features_classes()

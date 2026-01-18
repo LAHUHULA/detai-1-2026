@@ -18,6 +18,7 @@ dependencies = [
     "torch==2.7.1",
     "pandas>=2.0.0",
     "numpy>=1.26.0",
+    "psutil>=5.9.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -33,17 +34,19 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-num-server-rounds = 2
-num-clients = 5
-fraction-train = 1.0
-local-epochs = 1
+num_features = 40
+num_classes = 13
+num_server_rounds = 1
+num_clients = 1
+fraction_train = 1.0
+local_epochs = 1
 lr = 0.001
 
 # NEW: choose model and partition mode
-model-name = "mlp"          # "mlp" | "cnn1d" | "cnn_bilstm"
-partition-mode = "dirichlet"      # "iid" | "dirichlet"
-dirichlet-alpha = 0.3       # used only if partition-mode="dirichlet"
-batch-size = 256      # 128
+model_name = "mlp"          # "mlp" | "cnn1d" | "cnn_bilstm"
+partition_mode = "iid"      # "iid" | "dirichlet"
+dirichlet_alpha = 0.3       # used only if partition_mode="dirichlet"
+batch_size = 256      # 128
 
 # Default federation to use when running the app
 [tool.flwr.federations]
@@ -51,10 +54,12 @@ default = "local-simulation"
 
 # Local simulation federation with 10 virtual SuperNodes
 [tool.flwr.federations.local-simulation]
-options.num-supernodes = 5
+options.num-supernodes = 1
 
 # Remote federation example for use with SuperLink
 [tool.flwr.federations.remote-federation]
-address = "<SUPERLINK-ADDRESS>:<PORT>"
-insecure = true  # Remove this line to enable TLS
+#address = "<SUPERLINK-ADDRESS>:<PORT>"
+#insecure = true  # Remove this line to enable TLS
+address = "192.168.137.1:9093"
+insecure = true
 # root-certificates = "<PATH/TO/ca.crt>"  # For TLS setup

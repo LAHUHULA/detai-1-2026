@@ -12,15 +12,18 @@ app = ServerApp()
 
 @app.main()
 def main(grid: Grid, context: Context) -> None:
-    fraction_train: float = context.run_config["fraction-train"]
-    num_rounds: int = context.run_config["num-server-rounds"]
+    fraction_train: float = context.run_config["fraction_train"]
+    num_rounds: int = context.run_config["num_server_rounds"]
     lr: float = context.run_config["lr"]
+    
 
-    model_name: str = context.run_config.get("model-name", "mlp")
-    num_clients: int = int(context.run_config.get("num-clients", 10))  # add to pyproject
-    batch_size: int = int(context.run_config.get("batch-size", 256))
+    model_name: str = context.run_config.get("model_name", "mlp")
+    num_clients: int = int(context.run_config.get("num_clients", 10))  # add to pyproject
+    batch_size: int = int(context.run_config.get("batch_size", 256))
 
-    num_features, num_classes = get_num_features_classes()
+    num_features: int = int(context.run_config.get("num_features", 40))
+    num_classes: int = int(context.run_config.get("num_classes", 13))
+    # num_features, num_classes = get_num_features_classes()
 
     global_model = build_model(model_name, num_features, num_classes)
     arrays = ArrayRecord(global_model.state_dict())

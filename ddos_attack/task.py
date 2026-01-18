@@ -12,11 +12,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 # Flower partitioners
-from flwr_datasets.partitioner import (
-    IidPartitioner,
-    DirichletPartitioner,
-)
-from flwr_datasets.partitioner import IidPartitioner
+# from flwr_datasets.partitioner import (
+#     IidPartitioner,
+#     DirichletPartitioner,
+# )
+# from flwr_datasets.partitioner import IidPartitioner
 
 
 # ============================================================
@@ -125,7 +125,7 @@ def build_model(model_name: str, num_features: int, num_classes: int) -> nn.Modu
     if model_name in ["cnn_bilstm", "cnn-bilstm", "cnn_bi_lstm"]:
         return CNNBiLSTMNet(num_features, num_classes)
 
-    raise ValueError(f"Unknown model-name='{model_name}'. Use one of: mlp, cnn1d, cnn_bilstm")
+    raise ValueError(f"Unknown model_name='{model_name}'. Use one of: mlp, cnn1d, cnn_bilstm")
 
 
 # ============================================================
@@ -386,32 +386,52 @@ def load_data(
     mode: str = "iid",
     dirichlet_alpha: float = 0.5
 ) -> Tuple[DataLoader, DataLoader]:
+    """
+    REAL FL mode: Each client reads its own CSV file:
+      data/clients/{mode}/client_{partition_id}.csv
+    For non-IID:
+      data/clients/dirichlet_a{alpha}/client_{id}.csv  (alpha formatted)
+    """
 
-    key = (mode, float(dirichlet_alpha), int(num_partitions))
-    if key not in _partitions_cache:
-        _partitions_cache[key] = _build_partitions(mode, num_partitions, alpha=dirichlet_alpha)
+    # Build path
+    base_dir = Path(__file__).resolve().parent.parent  # project root
+    if mode == "iid":
+        local_csv = base_dir / "data" / "clients" / "iid" / f"client_{partition_id}.csv"
+    elif mode == "dirichlet":
+        # folder name: dirichlet_a0.3 (same as scripts generate)
+        alpha_str = str(dirichlet_alpha)
+        local_csv = base_dir / "data" / "clients" / f"dirichlet_a{alpha_str}" / f"client_{partition_id}.csv"
+    else:
+        raise ValueError(f"Unknown mode={mode}")
 
-    idx_client = _partitions_cache[key][partition_id]
+    if not local_csv.exists():
+        raise FileNotFoundError(f"Local client CSV not found: {local_csv}")
 
-    Xc = _train_features[idx_client]
-    yc = _train_labels[idx_client]
+    # Load local CSV
+    Xc, yc = _load_csv(str(local_csv))
+
+    # Fit scaler on LOCAL train (realistic) OR you can keep global if you want.
+    # Here: local scaler to mimic true FL.
+    mean = Xc.mean(axis=0)
+    std = Xc.std(axis=0)
+    std[std == 0] = 1.0
+    Xc = (Xc - mean) / std
 
     n = len(Xc)
     if n == 0:
-        raise ValueError(f"Client {partition_id} has 0 samples. Try larger alpha or fewer clients.")
+        raise ValueError(f"Client {partition_id} has 0 samples in {local_csv}")
 
-    # 80/20 train/val per client
+    # 80/20 split
     rng = np.random.RandomState(100 + partition_id)
-    idx = rng.permutation(len(Xc))
+    idx = rng.permutation(n)
     split = max(1, int(0.8 * n))
 
     X_train, y_train = Xc[idx[:split]], yc[idx[:split]]
     X_val, y_val = Xc[idx[split:]], yc[idx[split:]]
 
-    # nếu val rỗng (n=1 hoặc n nhỏ), fallback: dùng train làm val
+    # fallback if val is empty
     if len(X_val) == 0:
         X_val, y_val = X_train, y_train
-
 
     train_ds = CSVDataset(X_train, y_train)
     val_ds = CSVDataset(X_val, y_val)
@@ -420,6 +440,7 @@ def load_data(
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
     return train_loader, val_loader
+
 
 
 # ============================================================
