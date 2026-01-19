@@ -377,6 +377,33 @@ def _build_partitions(mode: str, num_partitions: int, alpha: float = 0.5, seed: 
         # IMPORTANT: return index arrays, not (X_part, y_part)
         return [np.asarray(idxs, dtype=np.int64) for idxs in client_indices]
 
+def get_num_features_classes_from_local_csv(partition_id: int, mode: str, dirichlet_alpha: float = 0.5):
+    """Read local client CSV and infer num_features/num_classes without global train_final.csv."""
+    from pathlib import Path
+    import os
+
+    # Prefer external data root (outside .flwr/apps) if provided
+    data_root_env = os.environ.get("DDOS_DATA_ROOT", "").strip()
+
+    if data_root_env:
+        data_root = Path(data_root_env).expanduser().resolve()
+    else:
+        # fallback: inside current app package
+        data_root = (Path(__file__).resolve().parent.parent / "data" / "clients").resolve()
+
+    if mode == "iid":
+        local_csv = data_root / "iid" / f"client_{partition_id}.csv"
+    elif mode == "dirichlet":
+        alpha_str = str(dirichlet_alpha)
+        local_csv = data_root / f"dirichlet_a{alpha_str}" / f"client_{partition_id}.csv"
+    else:
+        raise ValueError(f"Unknown mode={mode}")
+
+
+    X, y = _load_csv(str(local_csv))
+    num_features = int(X.shape[1])
+    num_classes = int(y.max()) + 1
+    return num_features, num_classes
 
 
 def load_data(
@@ -394,18 +421,26 @@ def load_data(
     """
 
     # Build path
-    base_dir = Path(__file__).resolve().parent.parent  # project root
+    from pathlib import Path
+    import os
+
+    # Prefer external data root (outside .flwr/apps) if provided
+    data_root_env = os.environ.get("DDOS_DATA_ROOT", "").strip()
+
+    if data_root_env:
+        data_root = Path(data_root_env).expanduser().resolve()
+    else:
+        # fallback: inside current app package
+        data_root = (Path(__file__).resolve().parent.parent / "data" / "clients").resolve()
+
     if mode == "iid":
-        local_csv = base_dir / "data" / "clients" / "iid" / f"client_{partition_id}.csv"
+        local_csv = data_root / "iid" / f"client_{partition_id}.csv"
     elif mode == "dirichlet":
-        # folder name: dirichlet_a0.3 (same as scripts generate)
         alpha_str = str(dirichlet_alpha)
-        local_csv = base_dir / "data" / "clients" / f"dirichlet_a{alpha_str}" / f"client_{partition_id}.csv"
+        local_csv = data_root / f"dirichlet_a{alpha_str}" / f"client_{partition_id}.csv"
     else:
         raise ValueError(f"Unknown mode={mode}")
 
-    if not local_csv.exists():
-        raise FileNotFoundError(f"Local client CSV not found: {local_csv}")
 
     # Load local CSV
     Xc, yc = _load_csv(str(local_csv))
@@ -447,9 +482,42 @@ def load_data(
 # 6. Train & Eval functions
 # ============================================================
 
-def train(net, trainloader, epochs, lr, device):
+def compute_class_weights_from_labels(labels: np.ndarray, num_classes: int) -> torch.Tensor:
+    """Compute inverse-frequency class weights from local labels."""
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
+    counts[counts == 0] = 1.0
+    weights = counts.sum() / counts
+    weights = weights / weights.mean()
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def train(net, trainloader, epochs, lr, device, num_classes: int | None = None):
     net.to(device)
-    criterion = nn.CrossEntropyLoss(weight=_class_weights_torch.to(device))
+
+    # Build criterion safely
+    global _class_weights_torch
+
+    if _class_weights_torch is not None:
+        criterion = nn.CrossEntropyLoss(weight=_class_weights_torch.to(device))
+    else:
+        # compute local weights from this client's trainloader (recommended for real FL)
+        if num_classes is None:
+            # fallback: infer from labels observed
+            all_y = []
+            for batch in trainloader:
+                all_y.append(batch["label"].detach().cpu())
+            y_np = torch.cat(all_y).numpy()
+            num_classes = int(y_np.max()) + 1
+        else:
+            # collect labels
+            all_y = []
+            for batch in trainloader:
+                all_y.append(batch["label"].detach().cpu())
+            y_np = torch.cat(all_y).numpy()
+
+        w = compute_class_weights_from_labels(y_np, int(num_classes)).to(device)
+        criterion = nn.CrossEntropyLoss(weight=w)
+
     optimizer = torch.optim.Adam(net.parameters(), lr=lr)
 
     net.train()
@@ -470,6 +538,7 @@ def train(net, trainloader, epochs, lr, device):
             batch_count += 1
 
     return total_loss / max(batch_count, 1)
+
 
 def multiclass_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int):
     """
@@ -513,11 +582,38 @@ def multiclass_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: 
             precision_weighted, recall_weighted, f1_weighted)
 
 def load_centralized_testloader(batch_size: int = 256) -> DataLoader:
-    _ensure_data_loaded()
-    if _test_features is None:
-        raise RuntimeError("test_final.csv not found/loaded")
-    ds = CSVDataset(_test_features, _test_labels)
+    """
+    Load test CSV for server-side evaluation in remote federation.
+
+    It will first try env var DDOS_SERVER_TEST_CSV (absolute path),
+    otherwise fall back to data/test_final.csv inside package.
+    """
+    import os
+    from pathlib import Path
+
+    # 1) Try absolute path from env
+    # env_path = os.environ.get("DDOS_SERVER_TEST_CSV", "").strip()
+    env_path = r"C:\Users\lanh2\Documents\HocTap\NamHoc_2023_2024\luanvan\flower\ddos-attack\data\test_final.csv"
+
+    if env_path:
+        test_path = Path(env_path).expanduser().resolve()
+        if not test_path.exists():
+            raise FileNotFoundError(f"DDOS_SERVER_TEST_CSV not found: {test_path}")
+        X_test, y_test = _load_csv(str(test_path))
+        ds = CSVDataset(X_test, y_test)
+        return DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    # 2) Fallback (may fail in remote federation if not packaged)
+    test_path = Path(__file__).resolve().parent.parent / "data" / "test_final.csv"
+    if not test_path.exists():
+        raise FileNotFoundError(
+            f"Test CSV not found. Set env DDOS_SERVER_TEST_CSV to an absolute path. Tried: {test_path}"
+        )
+
+    X_test, y_test = _load_csv(str(test_path))
+    ds = CSVDataset(X_test, y_test)
     return DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
+
 
 def get_class_weight_criterion(device):
     """

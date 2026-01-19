@@ -34,10 +34,10 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-num_features = 40
+num_features = 20
 num_classes = 13
-num_server_rounds = 1
-num_clients = 1
+num_server_rounds = 5
+num_clients = 2
 fraction_train = 1.0
 local_epochs = 1
 lr = 0.001
@@ -54,7 +54,7 @@ default = "local-simulation"
 
 # Local simulation federation with 10 virtual SuperNodes
 [tool.flwr.federations.local-simulation]
-options.num-supernodes = 1
+options.num-supernodes = 2
 
 # Remote federation example for use with SuperLink
 [tool.flwr.federations.remote-federation]

@@ -9,6 +9,8 @@ from ddos_attack.task import test as test_fn
 from ddos_attack.task import train as train_fn
 import time
 from ddos_attack.bench_pi import get_cpu_ram_percent, _try_read_pi_temp_c, get_net_bytes, log_round
+from ddos_attack.task import load_data, build_model, train, test, get_num_features_classes_from_local_csv
+
 
 
 # Flower ClientApp
@@ -26,8 +28,18 @@ def train(msg: Message, context: Context):
     batch_size = int(context.run_config.get("batch_size", 256))
 
     # Load model
-    num_features, num_classes = get_num_features_classes()
-    model = build_model(model_name, num_features, num_classes)
+    partition_id = int(context.node_config["partition-id"])
+    mode = context.run_config.get("partition_mode", "iid")
+    alpha = float(context.run_config.get("dirichlet_alpha", 0.5))
+
+    num_features, num_classes = get_num_features_classes_from_local_csv(
+        partition_id=partition_id,
+        mode=mode,
+        dirichlet_alpha=alpha,
+    )
+
+    model = build_model(context.run_config["model_name"], num_features, num_classes)
+
 
     # Initialize weights from server
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
@@ -59,6 +71,7 @@ def train(msg: Message, context: Context):
         context.run_config["local_epochs"],
         msg.content["config"]["lr"],
         device,
+        num_classes=num_classes
     )
 
         # --- benchmark after ---
@@ -109,8 +122,18 @@ def evaluate(msg: Message, context: Context):
     batch_size = int(context.run_config.get("batch_size", 256))
 
     # Load model
-    num_features, num_classes = get_num_features_classes()
-    model = build_model(model_name, num_features, num_classes)
+    partition_id = int(context.node_config["partition-id"])
+    mode = context.run_config.get("partition_mode", "iid")
+    alpha = float(context.run_config.get("dirichlet_alpha", 0.5))
+
+    num_features, num_classes = get_num_features_classes_from_local_csv(
+        partition_id=partition_id,
+        mode=mode,
+        dirichlet_alpha=alpha,
+    )
+
+    model = build_model(context.run_config["model_name"], num_features, num_classes)
+
 
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
 

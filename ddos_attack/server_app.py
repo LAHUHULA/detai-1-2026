@@ -21,7 +21,7 @@ def main(grid: Grid, context: Context) -> None:
     num_clients: int = int(context.run_config.get("num_clients", 10))  # add to pyproject
     batch_size: int = int(context.run_config.get("batch_size", 256))
 
-    num_features: int = int(context.run_config.get("num_features", 40))
+    num_features: int = int(context.run_config.get("num_features", 20))
     num_classes: int = int(context.run_config.get("num_classes", 13))
     # num_features, num_classes = get_num_features_classes()
 
