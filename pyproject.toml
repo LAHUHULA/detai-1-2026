@@ -34,19 +34,37 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-num_features = 20
-num_classes = 13
-num_server_rounds = 5
-num_clients = 2
-fraction_train = 1.0
-local_epochs = 1
+exp-id = "exp_bilstm_iid_N7"          # đổi tên tuỳ run
+num-server-rounds = 5
+num-clients = 2
+fraction-train = 1.0
+local-epochs = 1
 lr = 0.001
+batch-size = 256
 
-# NEW: choose model and partition mode
-model_name = "mlp"          # "mlp" | "cnn1d" | "cnn_bilstm"
-partition_mode = "iid"      # "iid" | "dirichlet"
-dirichlet_alpha = 0.3       # used only if partition_mode="dirichlet"
-batch_size = 256      # 128
+# ===== model / partition =====
+model-name = "cnn_bilstm"                # "mlp" | "cnn1d" | "cnn_bilstm"
+partition-mode = "iid"            # "iid" | "dirichlet"
+dirichlet-alpha = 0.3             # chỉ dùng nếu partition-mode="dirichlet"
+
+# ===== dataset (already MinMax scaled -> DO NOT rescale in code) =====
+num-features = 20
+num-classes = 13
+
+# Data root OUTSIDE app bundle (important for remote federation)
+# On Pi: "/home/ras-pi/ddos_data"
+# On PC (optional): "C:/ddos_data"
+data-root = "~/projects/ddos-attack/data"
+
+# Centralized test (server-side on PC)
+do-centralized-test = true
+server-test-csv = "C:/Users/lanh2/Documents/HocTap/NamHoc_2023_2024/luanvan/flower/ddos-attack/data/test_final.csv"
+
+# Inference benchmark (run separately on Pi after FL)
+infer-bench-csv = "~/projects/ddos-attack/data/infer_bench.csv"
+
+# Where to write outputs (server)
+output-dir = "outputs"
 
 # Default federation to use when running the app
 [tool.flwr.federations]

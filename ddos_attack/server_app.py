@@ -1,110 +1,152 @@
 import time
-import torch
+import json
+import csv
+from pathlib import Path
 
+import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context
 from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import FedAvg
 
-from ddos_attack.task import build_model, load_centralized_testloader
-from ddos_attack.task import test as test_fn
+from ddos_attack.task import build_model, load_centralized_testloader, test as test_fn
 
 app = ServerApp()
 
 
-def _get_run_cfg(context: Context):
-    cfg = context.run_config
-    return {
-        "fraction_train": float(cfg.get("fraction_train", 1.0)),
-        "num_rounds": int(cfg.get("num_server_rounds", 1)),
-        "lr": float(cfg.get("lr", 1e-3)),
-        "model_name": cfg.get("model_name", "mlp"),
-        "num_clients": int(cfg.get("num_clients", 2)),
-        "batch_size": int(cfg.get("batch_size", 256)),
-        # IMPORTANT: must be consistent across clients
-        "num_features": int(cfg.get("num_features", 20)),
-        "num_classes": int(cfg.get("num_classes", 13)),
-        "do_centralized_test": bool(cfg.get("do_centralized_test", True)),
-    }
+def _ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _save_json(path: Path, obj: dict) -> None:
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _append_csv_row(path: Path, header: list[str], row: dict) -> None:
+    file_exists = path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if not file_exists:
+            w.writeheader()
+        w.writerow(row)
 
 
 @app.main()
 def main(grid: Grid, context: Context) -> None:
-    run_cfg = _get_run_cfg(context)
+    cfg = context.run_config
+
+    exp_id = str(cfg.get("exp-id", "exp")).strip()
+    out_root = Path(str(cfg.get("output-dir", "outputs")))
+    out_dir = _ensure_dir(out_root / exp_id)
+
+    # Read config (kebab-case from pyproject.toml)
+    num_rounds = int(cfg["num-server-rounds"])
+    fraction_train = float(cfg["fraction-train"])
+    lr = float(cfg["lr"])
+    local_epochs = int(cfg["local-epochs"])
+    batch_size = int(cfg.get("batch-size", 256))
+
+    model_name = str(cfg.get("model-name", "mlp"))
+    num_clients = int(cfg.get("num-clients", 7))
+    num_features = int(cfg.get("num-features", 40))
+    num_classes = int(cfg.get("num-classes", 13))
+
+    partition_mode = str(cfg.get("partition-mode", "iid"))
+    dirichlet_alpha = float(cfg.get("dirichlet-alpha", 0.5))
+
+    do_centralized_test = bool(cfg.get("do-centralized-test", True))
+    server_test_csv = str(cfg.get("server-test-csv", ""))
+
+    # Save run config snapshot
+    _save_json(out_dir / "run_config.json", dict(cfg))
 
     # Build global model
-    global_model = build_model(
-        model_name=run_cfg["model_name"],
-        num_features=run_cfg["num_features"],
-        num_classes=run_cfg["num_classes"],
-    )
+    global_model = build_model(model_name, num_features, num_classes)
     initial_arrays = ArrayRecord(global_model.state_dict())
 
-    # FL Strategy
-    strategy = FedAvg(fraction_train=run_cfg["fraction_train"])
-
-    # Train
+    # Start FL
+    strategy = FedAvg(fraction_train=fraction_train)
     t0 = time.perf_counter()
     result = strategy.start(
         grid=grid,
         initial_arrays=initial_arrays,
-        train_config=ConfigRecord({"lr": run_cfg["lr"]}),
-        num_rounds=run_cfg["num_rounds"],
+        train_config=ConfigRecord({"lr": lr}),
+        num_rounds=num_rounds,
     )
     t1 = time.perf_counter()
 
     # Save final model
     state_dict = result.arrays.to_torch_state_dict()
-    out_path = f"final_model_{run_cfg['model_name']}.pt"
-    torch.save(state_dict, out_path)
-    print(f"\nSaved {out_path}")
+    model_path = out_dir / f"final_model_{model_name}.pt"
+    torch.save(state_dict, str(model_path))
 
-    # Estimated logging
-    total_time = t1 - t0
-    avg_round_time = total_time / max(run_cfg["num_rounds"], 1)
+    # Estimate comm/time
+    total_time = float(t1 - t0)
+    avg_round_time = total_time / max(num_rounds, 1)
+    model_bytes = sum(v.numel() * v.element_size() for v in state_dict.values() if torch.is_tensor(v))
+    clients_per_round = max(1, int(round(fraction_train * num_clients)))
+    est_comm_per_round_mib = float((model_bytes * 2 * clients_per_round) / (1024.0 ** 2))
 
-    model_bytes = 0
-    for v in state_dict.values():
-        if torch.is_tensor(v):
-            model_bytes += v.numel() * v.element_size()
-
-    clients_per_round = max(1, int(round(run_cfg["fraction_train"] * run_cfg["num_clients"])))
-    comm_overhead_per_round = model_bytes * 2 * clients_per_round  # download + upload
-
-    print("\n=== FL LOGGING (estimated) ===")
-    print(f"Total time (s): {total_time:.2f}")
-    print(f"Avg round time (s): {avg_round_time:.2f}")
-    print(f"Model size (MB): {model_bytes / (1024**2):.2f}")
-    print(f"Estimated comm/round (MB): {comm_overhead_per_round / (1024**2):.2f}")
-
-    # Optional: centralized test on server
-    if not run_cfg["do_centralized_test"]:
-        return
-
-    try:
+    # Centralized test
+    centralized = {}
+    if do_centralized_test:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-        model = build_model(
-            model_name=run_cfg["model_name"],
-            num_features=run_cfg["num_features"],
-            num_classes=run_cfg["num_classes"],
-        ).to(device)
-
+        model = build_model(model_name, num_features, num_classes).to(device)
         model.load_state_dict(state_dict)
 
-        testloader = load_centralized_testloader(batch_size=run_cfg["batch_size"])
-
+        testloader = load_centralized_testloader(server_test_csv, batch_size=batch_size)
         loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = test_fn(
-            net=model,
-            testloader=testloader,
-            device=device,
-            num_classes=run_cfg["num_classes"],
-            criterion=None,  # default CrossEntropyLoss
+            model, testloader, device, num_classes=num_classes, criterion=None
         )
+        centralized = {
+            "global_test_loss": float(loss),
+            "global_test_acc": float(acc),
+            "precision_macro": float(p_macro),
+            "recall_macro": float(r_macro),
+            "f1_macro": float(f1_macro),
+            "precision_weighted": float(p_w),
+            "recall_weighted": float(r_w),
+            "f1_weighted": float(f1_w),
+        }
 
-        print("\n=== CENTRALIZED TEST (test_final.csv) ===")
-        print(f"loss={loss:.4f} | acc={acc:.4f}")
-        print(f"Macro:    P={p_macro:.4f} | R={r_macro:.4f} | F1={f1_macro:.4f}")
-        print(f"Weighted: P={p_w:.4f} | R={r_w:.4f} | F1={f1_w:.4f}")
+    # Save per-run summary json
+    run_summary = {
+        "exp_id": exp_id,
+        "model": model_name,
+        "partition_mode": partition_mode,
+        "dirichlet_alpha": dirichlet_alpha if partition_mode == "dirichlet" else None,
+        "num_clients": num_clients,
+        "num_rounds": num_rounds,
+        "fraction_train": fraction_train,
+        "local_epochs": local_epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "num_features": num_features,
+        "num_classes": num_classes,
+        "total_time_s": total_time,
+        "avg_round_time_s": float(avg_round_time),
+        "model_size_kib": float(model_bytes / 1024.0),
+        "est_comm_per_round_mib": est_comm_per_round_mib,
+        **centralized,
+        "final_model_path": str(model_path),
+    }
+    _save_json(out_dir / "run_summary.json", run_summary)
 
-    except Exception as e:
-        print("\n[WARNING] Centralized test failed:", repr(e))
+    # Append global summary CSV
+    summary_path = out_root / "results_summary.csv"
+    header = [
+        "exp_id", "model", "partition_mode", "dirichlet_alpha",
+        "num_clients", "num_rounds", "fraction_train", "local_epochs",
+        "batch_size", "lr", "num_features", "num_classes",
+        "total_time_s", "avg_round_time_s", "model_size_kib", "est_comm_per_round_mib",
+        "global_test_loss", "global_test_acc",
+        "precision_macro", "recall_macro", "f1_macro",
+        "precision_weighted", "recall_weighted", "f1_weighted",
+        "final_model_path",
+    ]
+    for k in header:
+        run_summary.setdefault(k, None)
+    _append_csv_row(summary_path, header, run_summary)
+
+    print(f"\n[OK] Saved: {out_dir}")
+    print(f"[OK] Updated: {summary_path}")

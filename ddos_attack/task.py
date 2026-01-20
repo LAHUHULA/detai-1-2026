@@ -1,9 +1,15 @@
-"""ddos-attack: Flower / PyTorch app for DDoS detection (CSV)."""
+"""ddos-attack: Flower / PyTorch app for DDoS detection (CSV).
+- REAL FL: each client reads its own local CSV partition from data-root.
+- IMPORTANT: CSVs are already MinMax-scaled -> DO NOT scale again.
+- IMPORTANT: label mapping is REQUIRED and must be consistent across all nodes.
+"""
 
-from pathlib import Path
-from typing import Tuple, Dict, Any
+from __future__ import annotations
+
 import os
 import json
+from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,18 +21,66 @@ from torch.utils.data import DataLoader, Dataset
 
 
 # ============================================================
-# 0. Global config: paths
+# 0) Strict label map (REQUIRED)
 # ============================================================
-BASE_DIR = Path(__file__).resolve().parent.parent  # ddos-attack/
-TRAIN_CSV_PATH = str(BASE_DIR / "data" / "train_final.csv")
-TEST_CSV_PATH = str(BASE_DIR / "data" / "test_final.csv")
 
-# IMPORTANT: Your CSV already MinMaxScaled => disable any internal scaling
-APPLY_INTERNAL_SCALING = False  # keep False
+_label_to_int: dict[str, int] | None = None
+_int_to_label: list[str] | None = None
+
+
+def _load_label_map_required() -> None:
+    """Load label mapping from env var DDOS_LABEL_MAP (REQUIRED)."""
+    global _label_to_int, _int_to_label
+
+    if _label_to_int is not None:
+        return
+
+    lm_path = os.environ.get("DDOS_LABEL_MAP", "").strip()
+    if not lm_path:
+        raise RuntimeError(
+            "DDOS_LABEL_MAP is REQUIRED but not set.\n"
+            "Set it to an absolute path of label_map.json.\n"
+            "Example (Linux):  export DDOS_LABEL_MAP=/home/ras-pi/ddos_data/label_map.json\n"
+            "Example (Windows PowerShell): $env:DDOS_LABEL_MAP='C:\\ddos_data\\label_map.json'"
+        )
+
+    p = Path(lm_path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"DDOS_LABEL_MAP not found: {p}")
+
+    obj = json.loads(p.read_text(encoding="utf-8"))
+
+    if not isinstance(obj, dict) or not obj:
+        raise ValueError(f"Invalid label_map.json format (must be non-empty dict): {p}")
+
+    # validate integer values + build inverse list
+    label_to_int: dict[str, int] = {}
+    max_id = -1
+    for k, v in obj.items():
+        if not isinstance(k, str):
+            raise ValueError(f"label_map key must be string, got {type(k)}")
+        if not isinstance(v, int):
+            raise ValueError(f"label_map value must be int, label={k}, got {type(v)}")
+        if v < 0:
+            raise ValueError(f"label_map value must be >=0, label={k}, got {v}")
+        label_to_int[k] = v
+        max_id = max(max_id, v)
+
+    inv: list[str] = [""] * (max_id + 1)
+    for lab, idx in label_to_int.items():
+        inv[idx] = lab
+
+    if any(x == "" for x in inv):
+        # allow gaps? -> not recommended, fail fast
+        missing = [i for i, x in enumerate(inv) if x == ""]
+        raise ValueError(f"label_map has missing indices: {missing[:20]}... Fix label_map.json.")
+
+    _label_to_int = label_to_int
+    _int_to_label = inv
 
 
 # ============================================================
-# 1. Models (3 options)
+# 1) Models
 # ============================================================
 
 class MLPNet(nn.Module):
@@ -55,24 +109,20 @@ class CNN1DNet(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm1d(32)
-
         self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm1d(64)
-
         self.pool = nn.AdaptiveMaxPool1d(1)
 
         self.fc1 = nn.Linear(64, 64)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(0.30)
         self.fc2 = nn.Linear(64, num_classes)
 
     def forward(self, x):
         if x.dim() == 2:
             x = x.unsqueeze(1)  # [B, 1, F]
-
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.pool(x).squeeze(-1)  # [B, 64]
-
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
         return self.fc2(x)
@@ -92,37 +142,34 @@ class CNNBiLSTMNet(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
-
         self.dropout = nn.Dropout(0.30)
         self.fc = nn.Linear(64 * 2, num_classes)
 
     def forward(self, x):
-        x = x.unsqueeze(1)                  # [B, 1, F]
-        x = F.relu(self.conv1(x))           # [B, 64, F]
-        x = F.relu(self.conv2(x))           # [B, 128, F]
-        x = self.pool(x)                    # [B, 128, F/2]
-
-        x = x.permute(0, 2, 1)              # [B, F/2, 128]
-        out, _ = self.lstm(x)               # [B, F/2, 128]
-        out = out[:, -1, :]                 # [B, 128]
-
+        x = x.unsqueeze(1)            # [B, 1, F]
+        x = F.relu(self.conv1(x))     # [B, 64, F]
+        x = F.relu(self.conv2(x))     # [B, 128, F]
+        x = self.pool(x)              # [B, 128, F/2]
+        x = x.permute(0, 2, 1)        # [B, F/2, 128]
+        out, _ = self.lstm(x)         # [B, F/2, 128]
+        out = out[:, -1, :]           # [B, 128]
         out = self.dropout(out)
         return self.fc(out)
 
 
 def build_model(model_name: str, num_features: int, num_classes: int) -> nn.Module:
-    model_name = model_name.lower().strip()
-    if model_name == "mlp":
+    mn = model_name.lower().strip()
+    if mn == "mlp":
         return MLPNet(num_features, num_classes)
-    if model_name == "cnn1d":
+    if mn == "cnn1d":
         return CNN1DNet(num_features, num_classes)
-    if model_name in ["cnn_bilstm", "cnn-bilstm", "cnn_bi_lstm"]:
+    if mn in ["cnn_bilstm", "cnn-bilstm", "cnn_bi_lstm"]:
         return CNNBiLSTMNet(num_features, num_classes)
     raise ValueError(f"Unknown model_name='{model_name}'. Use one of: mlp, cnn1d, cnn_bilstm")
 
 
 # ============================================================
-# 2. CSV Dataset Wrapper
+# 2) Dataset
 # ============================================================
 
 class CSVDataset(Dataset):
@@ -138,155 +185,72 @@ class CSVDataset(Dataset):
 
 
 # ============================================================
-# 3. Global caches
-# ============================================================
-
-_train_features: np.ndarray | None = None
-_train_labels: np.ndarray | None = None
-
-_test_features: np.ndarray | None = None
-_test_labels: np.ndarray | None = None
-
-_num_features: int | None = None
-_num_classes: int | None = None
-
-_label_to_int: dict | None = None
-_int_to_label: list | None = None
-
-_scaler_mean: np.ndarray | None = None
-_scaler_std: np.ndarray | None = None
-
-_class_weights_torch = None
-
-
-# ============================================================
-# 3.1 Label map (FIXED) helpers
-# ============================================================
-
-def _load_label_map_if_available():
-    """Load a fixed label mapping from DDOS_LABEL_MAP to ensure consistency across devices."""
-    global _label_to_int, _int_to_label
-
-    if _label_to_int is not None:
-        return
-
-    p = os.environ.get("DDOS_LABEL_MAP", "").strip()
-    if not p:
-        return  # fallback to auto-fit on first loaded file (NOT recommended for real FL)
-
-    mp = Path(p).expanduser().resolve()
-    if not mp.exists():
-        raise FileNotFoundError(f"DDOS_LABEL_MAP not found: {mp}")
-
-    obj = json.loads(mp.read_text(encoding="utf-8"))
-    _int_to_label = obj["labels"]
-    _label_to_int = obj["map"]
-
-
-# ============================================================
-# 3.2 CSV loading (NO scaling here)
+# 3) CSV loader (NO scaling; label_map REQUIRED)
 # ============================================================
 
 def _load_csv(path: str | Path) -> Tuple[np.ndarray, np.ndarray]:
-    global _label_to_int, _int_to_label
-
-    _load_label_map_if_available()
+    """Load CSV and encode labels using REQUIRED global mapping."""
+    _load_label_map_required()
+    assert _label_to_int is not None
 
     df = pd.read_csv(path)
 
     label_col = "label" if "label" in df.columns else ("Label" if "Label" in df.columns else df.columns[-1])
+
     y_raw = df[label_col].astype(str).to_numpy()
     X = df.drop(columns=[label_col]).to_numpy()
 
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0).astype("float32")
 
-    # If mapping not provided, fallback auto-fit (simulation only)
-    if _label_to_int is None:
-        unique = sorted(set(y_raw.tolist()))
-        _int_to_label = unique
-        _label_to_int = {lab: i for i, lab in enumerate(_int_to_label)}
-
     y = np.array([_label_to_int.get(lab, -1) for lab in y_raw], dtype="int64")
     if (y < 0).any():
         unknown = sorted(set(y_raw[y < 0].tolist()))
-        raise ValueError(f"Found labels not in fitted label mapping: {unknown[:10]} ...")
+        raise ValueError(
+            f"Found labels not in label_map.json: {unknown[:20]}...\n"
+            f"CSV={path}"
+        )
 
     return X, y
 
 
 # ============================================================
-# 3.3 Global load for simulation/inspection (NO scaling)
+# 4) Local-client CSV utilities (remote federation)
 # ============================================================
 
-def _ensure_data_loaded(train_path=TRAIN_CSV_PATH, test_path=TEST_CSV_PATH):
-    global _train_features, _train_labels, _test_features, _test_labels
-    global _scaler_mean, _scaler_std, _num_features, _num_classes, _class_weights_torch
-
-    if _train_features is None:
-        X_train, y_train = _load_csv(train_path)
-
-        rng = np.random.RandomState(42)
-        idx = rng.permutation(len(X_train))
-        X_train = X_train[idx]
-        y_train = y_train[idx]
-
-        # CSV already MinMaxScaled => do NOT scale again
-        _scaler_mean = np.zeros((X_train.shape[1],), dtype=np.float32)
-        _scaler_std = np.ones((X_train.shape[1],), dtype=np.float32)
-
-        _train_features = X_train.astype("float32")
-        _train_labels = y_train.astype("int64")
-
-        _num_features = _train_features.shape[1]
-        _num_classes = int(_train_labels.max()) + 1
-
-        # global class weights (optional)
-        counts = np.bincount(_train_labels, minlength=_num_classes).astype(np.float32)
-        counts[counts == 0] = 1.0
-        weights = counts.sum() / counts
-        weights = weights / weights.mean()
-        _class_weights_torch = torch.tensor(weights, dtype=torch.float32)
-
-    if _test_features is None and Path(test_path).exists():
-        X_test, y_test = _load_csv(test_path)
-        _test_features = X_test.astype("float32")
-        _test_labels = y_test.astype("int64")
+def _resolve_data_root(data_root: str | None) -> Path:
+    """data_root should point to ddos_data directory which contains clients/ and infer_bench.csv."""
+    if data_root and str(data_root).strip():
+        return Path(data_root).expanduser().resolve()
+    # fallback only for local dev
+    return (Path(__file__).resolve().parent.parent / "data").resolve()
 
 
-def get_num_features_classes() -> Tuple[int, int]:
-    _ensure_data_loaded()
-    return int(_num_features), int(_num_classes)
-
-
-def get_flower_dataset() -> Dict[str, Any]:
-    _ensure_data_loaded()
-    return {"features": _train_features, "label": _train_labels}
-
-
-# ============================================================
-# 4. REAL FL: local client CSV reading
-# ============================================================
-
-def _get_data_root_clients() -> Path:
-    """Return the directory containing data/clients (outside .flwr/apps if DDOS_DATA_ROOT is set)."""
-    data_root_env = os.environ.get("DDOS_DATA_ROOT", "").strip()
-    if data_root_env:
-        return Path(data_root_env).expanduser().resolve()
-    # fallback: inside app package (may not have data)
-    return (Path(__file__).resolve().parent.parent / "data" / "clients").resolve()
-
-
-def get_num_features_classes_from_local_csv(partition_id: int, mode: str, dirichlet_alpha: float = 0.5):
-    data_root = _get_data_root_clients()
+def _local_client_csv_path(
+    partition_id: int,
+    mode: str,
+    dirichlet_alpha: float,
+    data_root: str | None,
+) -> Path:
+    root = _resolve_data_root(data_root)
+    clients_dir = root / "clients"
 
     if mode == "iid":
-        local_csv = data_root / "iid" / f"client_{partition_id}.csv"
-    elif mode == "dirichlet":
-        local_csv = data_root / f"dirichlet_a{str(dirichlet_alpha)}" / f"client_{partition_id}.csv"
-    else:
-        raise ValueError(f"Unknown mode={mode}")
+        return clients_dir / "iid" / f"client_{partition_id}.csv"
 
-    X, y = _load_csv(str(local_csv))
+    if mode == "dirichlet":
+        return clients_dir / f"dirichlet_a{dirichlet_alpha}" / f"client_{partition_id}.csv"
+
+    raise ValueError(f"Unknown partition mode: {mode}")
+
+
+def get_num_features_classes_from_local_csv(
+    partition_id: int,
+    mode: str,
+    dirichlet_alpha: float,
+    data_root: str | None,
+) -> Tuple[int, int]:
+    p = _local_client_csv_path(partition_id, mode, dirichlet_alpha, data_root)
+    X, y = _load_csv(str(p))
     return int(X.shape[1]), int(y.max()) + 1
 
 
@@ -295,32 +259,26 @@ def load_data(
     num_partitions: int,
     batch_size: int = 256,
     mode: str = "iid",
-    dirichlet_alpha: float = 0.5
+    dirichlet_alpha: float = 0.5,
+    data_root: str | None = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
-    REAL FL mode:
-      - Read pre-split client CSV: already MinMaxScaled => DO NOT scale again.
+    Real FL: each client reads its own CSV partition:
+      {data_root}/clients/iid/client_{id}.csv
+      {data_root}/clients/dirichlet_a{alpha}/client_{id}.csv
+
+    NOTE: CSV is already MinMax scaled -> do NOT apply scaling again.
     """
-    data_root = _get_data_root_clients()
-
-    if mode == "iid":
-        local_csv = data_root / "iid" / f"client_{partition_id}.csv"
-    elif mode == "dirichlet":
-        local_csv = data_root / f"dirichlet_a{str(dirichlet_alpha)}" / f"client_{partition_id}.csv"
-    else:
-        raise ValueError(f"Unknown mode={mode}")
-
+    local_csv = _local_client_csv_path(int(partition_id), mode, float(dirichlet_alpha), data_root)
     if not local_csv.exists():
         raise FileNotFoundError(f"Client CSV not found: {local_csv}")
 
     Xc, yc = _load_csv(str(local_csv))
-    Xc = Xc.astype("float32")  # already scaled (MinMaxScaler)
-
     n = len(Xc)
     if n == 0:
-        raise ValueError(f"Client {partition_id} has 0 samples in {local_csv}")
+        raise ValueError(f"Client {partition_id} has 0 samples: {local_csv}")
 
-    rng = np.random.RandomState(100 + partition_id)
+    rng = np.random.RandomState(100 + int(partition_id))
     idx = rng.permutation(n)
     split = max(1, int(0.8 * n))
 
@@ -330,17 +288,13 @@ def load_data(
     if len(X_val) == 0:
         X_val, y_val = X_train, y_train
 
-    train_ds = CSVDataset(X_train, y_train)
-    val_ds = CSVDataset(X_val, y_val)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
-
+    train_loader = DataLoader(CSVDataset(X_train, y_train), batch_size=batch_size, shuffle=True, drop_last=False)
+    val_loader = DataLoader(CSVDataset(X_val, y_val), batch_size=batch_size, shuffle=False, drop_last=False)
     return train_loader, val_loader
 
 
 # ============================================================
-# 5. Loss weights + Train/Eval
+# 5) Training/Eval + metrics
 # ============================================================
 
 def compute_class_weights_from_labels(labels: np.ndarray, num_classes: int) -> torch.Tensor:
@@ -351,31 +305,25 @@ def compute_class_weights_from_labels(labels: np.ndarray, num_classes: int) -> t
     return torch.tensor(weights, dtype=torch.float32)
 
 
-def train(net, trainloader, epochs, lr, device, num_classes: int | None = None):
+def train(net, trainloader, epochs, lr, device, num_classes: int):
     net.to(device)
 
-    global _class_weights_torch
+    # local class weights from local train data (robust for non-IID)
+    all_y = []
+    for batch in trainloader:
+        all_y.append(batch["label"].detach().cpu())
+    y_np = torch.cat(all_y).numpy()
 
-    # If global weights exist (simulation), use them; else compute local weights
-    if _class_weights_torch is not None:
-        criterion = nn.CrossEntropyLoss(weight=_class_weights_torch.to(device))
-    else:
-        all_y = []
-        for batch in trainloader:
-            all_y.append(batch["label"].detach().cpu())
-        y_np = torch.cat(all_y).numpy()
-        if num_classes is None:
-            num_classes = int(y_np.max()) + 1
-        w = compute_class_weights_from_labels(y_np, int(num_classes)).to(device)
-        criterion = nn.CrossEntropyLoss(weight=w)
+    w = compute_class_weights_from_labels(y_np, int(num_classes)).to(device)
+    criterion = nn.CrossEntropyLoss(weight=w)
 
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(net.parameters(), lr=float(lr))
 
     net.train()
     total_loss = 0.0
     batch_count = 0
 
-    for _ in range(epochs):
+    for _ in range(int(epochs)):
         for batch in trainloader:
             x = batch["features"].to(device)
             y = batch["label"].to(device)
@@ -385,7 +333,7 @@ def train(net, trainloader, epochs, lr, device, num_classes: int | None = None):
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += float(loss.item())
             batch_count += 1
 
     return total_loss / max(batch_count, 1)
@@ -394,7 +342,7 @@ def train(net, trainloader, epochs, lr, device, num_classes: int | None = None):
 def multiclass_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int):
     cm = torch.zeros((num_classes, num_classes), dtype=torch.int64)
     for t, p in zip(y_true, y_pred):
-        cm[t, p] += 1
+        cm[int(t), int(p)] += 1
 
     tp = torch.diag(cm).to(torch.float32)
     fp = cm.sum(dim=0).to(torch.float32) - tp
@@ -420,39 +368,9 @@ def multiclass_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: 
     recall_weighted = (recall * weights).sum().item()
     f1_weighted = (f1 * weights).sum().item()
 
-    return (
-        accuracy.item(),
-        precision_macro, recall_macro, f1_macro,
-        precision_weighted, recall_weighted, f1_weighted
-    )
-
-
-def load_centralized_testloader(batch_size: int = 256) -> DataLoader:
-    """
-    Server-side evaluation:
-      - Reads from env DDOS_SERVER_TEST_CSV if provided (absolute path).
-      - Else tries package path data/test_final.csv.
-    Note: No scaling applied (CSV already MinMaxScaled).
-    """
-    env_path = os.environ.get("DDOS_SERVER_TEST_CSV", "").strip()
-
-    if env_path:
-        test_path = Path(env_path).expanduser().resolve()
-        if not test_path.exists():
-            raise FileNotFoundError(f"DDOS_SERVER_TEST_CSV not found: {test_path}")
-        X_test, y_test = _load_csv(str(test_path))
-        ds = CSVDataset(X_test, y_test)
-        return DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
-
-    test_path = Path(__file__).resolve().parent.parent / "data" / "test_final.csv"
-    if not test_path.exists():
-        raise FileNotFoundError(
-            f"Test CSV not found. Set env DDOS_SERVER_TEST_CSV to an absolute path. Tried: {test_path}"
-        )
-
-    X_test, y_test = _load_csv(str(test_path))
-    ds = CSVDataset(X_test, y_test)
-    return DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    return (accuracy.item(),
+            precision_macro, recall_macro, f1_macro,
+            precision_weighted, recall_weighted, f1_weighted)
 
 
 def test(net, testloader, device, num_classes: int, criterion=None):
@@ -463,17 +381,18 @@ def test(net, testloader, device, num_classes: int, criterion=None):
     net.eval()
     total_loss = 0.0
     batch_count = 0
-    all_true, all_pred = [], []
+
+    all_true = []
+    all_pred = []
 
     with torch.no_grad():
         for batch in testloader:
             x = batch["features"].to(device)
             y = batch["label"].to(device)
-
             logits = net(x)
             loss = criterion(logits, y)
 
-            total_loss += loss.item()
+            total_loss += float(loss.item())
             batch_count += 1
 
             pred = torch.argmax(logits, dim=1)
@@ -481,10 +400,17 @@ def test(net, testloader, device, num_classes: int, criterion=None):
             all_pred.append(pred.detach().cpu())
 
     avg_loss = total_loss / max(batch_count, 1)
-
     y_true = torch.cat(all_true, dim=0)
     y_pred = torch.cat(all_pred, dim=0)
 
     (acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w) = multiclass_metrics(y_true, y_pred, num_classes)
-
     return avg_loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w
+
+
+def load_centralized_testloader(test_csv_path: str, batch_size: int = 256) -> DataLoader:
+    """Server-side evaluation uses a global test CSV path (absolute path on PC)."""
+    p = Path(test_csv_path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"server-test-csv not found: {p}")
+    X_test, y_test = _load_csv(str(p))
+    return DataLoader(CSVDataset(X_test, y_test), batch_size=batch_size, shuffle=False, drop_last=False)

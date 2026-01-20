@@ -1,11 +1,18 @@
-import json, pandas as pd
+import json
+import pandas as pd
 
-df = pd.read_csv("data/train_final.csv")
+CSV = "data/train_final.csv"
+OUT = "data/label_map.json"
+
+df = pd.read_csv(CSV)
 label_col = "label" if "label" in df.columns else ("Label" if "Label" in df.columns else df.columns[-1])
+
 labels = sorted(df[label_col].astype(str).unique().tolist())
-m = {lab:i for i,lab in enumerate(labels)}
+label_map = {lab: i for i, lab in enumerate(labels)}
 
-with open("data/label_map.json","w",encoding="utf-8") as f:
-    json.dump({"labels":labels,"map":m}, f, ensure_ascii=False, indent=2)
+with open(OUT, "w", encoding="utf-8") as f:
+    json.dump(label_map, f, ensure_ascii=False, indent=2)
 
-print("saved data/label_map.json, num_classes=", len(labels))
+print("Saved:", OUT)
+print("Num classes:", len(labels))
+print(label_map)
