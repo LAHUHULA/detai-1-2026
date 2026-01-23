@@ -65,7 +65,13 @@ def main(grid: Grid, context: Context) -> None:
     initial_arrays = ArrayRecord(global_model.state_dict())
 
     # Start FL
-    strategy = FedAvg(fraction_train=fraction_train)
+    strategy = FedAvg(
+        fraction_train=fraction_train,
+        fraction_evaluate=fraction_train,
+        min_train_nodes=num_clients,
+        min_evaluate_nodes=num_clients,
+        min_available_nodes=num_clients,
+    )
     t0 = time.perf_counter()
     result = strategy.start(
         grid=grid,

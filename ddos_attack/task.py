@@ -227,6 +227,7 @@ def _resolve_data_root(data_root: str | None) -> Path:
 
 def _local_client_csv_path(
     partition_id: int,
+    num_partitions: int,
     mode: str,
     dirichlet_alpha: float,
     data_root: str | None,
@@ -235,21 +236,22 @@ def _local_client_csv_path(
     clients_dir = root / "clients"
 
     if mode == "iid":
-        return clients_dir / "iid" / f"client_{partition_id}.csv"
+        return clients_dir / f"iid_n{num_partitions}" / f"client_{partition_id}.csv"
 
     if mode == "dirichlet":
-        return clients_dir / f"dirichlet_a{dirichlet_alpha}" / f"client_{partition_id}.csv"
+        return clients_dir / f"dirichlet_a{dirichlet_alpha}_n{num_partitions}" / f"client_{partition_id}.csv"
 
     raise ValueError(f"Unknown partition mode: {mode}")
 
 
 def get_num_features_classes_from_local_csv(
     partition_id: int,
+    num_partitions: int,
     mode: str,
     dirichlet_alpha: float,
     data_root: str | None,
 ) -> Tuple[int, int]:
-    p = _local_client_csv_path(partition_id, mode, dirichlet_alpha, data_root)
+    p = _local_client_csv_path(partition_id, int(num_partitions), mode, dirichlet_alpha, data_root)
     X, y = _load_csv(str(p))
     return int(X.shape[1]), int(y.max()) + 1
 
@@ -269,7 +271,7 @@ def load_data(
 
     NOTE: CSV is already MinMax scaled -> do NOT apply scaling again.
     """
-    local_csv = _local_client_csv_path(int(partition_id), mode, float(dirichlet_alpha), data_root)
+    local_csv = _local_client_csv_path(int(partition_id), int(num_partitions), mode, float(dirichlet_alpha), data_root)
     if not local_csv.exists():
         raise FileNotFoundError(f"Client CSV not found: {local_csv}")
 

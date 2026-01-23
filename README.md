@@ -45,3 +45,12 @@ You can run Flower on Docker too! Check out the [Flower with Docker](https://flo
 - Join the Flower community!
   - [Flower Slack](https://flower.ai/join-slack/)
   - [Flower Discuss](https://discuss.flower.ai/)
+
+
+- ras-pi-1:192.168.0.207
+- ras-pi-2:192.168.0.186
+- ras-pi-3:192.168.0.
+- ras-pi-4:192.168.0.239
+- ras-pi-5:192.168.0.46
+- ras-pi-6:192.168.0.179
+- ras-pi-7:192.168.0.119
