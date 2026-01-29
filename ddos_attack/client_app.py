@@ -39,6 +39,7 @@ def train(msg: Message, context: Context):
     # infer model input/output from local CSV (avoid global train_final)
     num_features, num_classes = get_num_features_classes_from_local_csv(
         partition_id=partition_id,
+        num_partitions=num_partitions,
         mode=partition_mode,
         dirichlet_alpha=dirichlet_alpha,
         data_root=data_root,
@@ -128,6 +129,7 @@ def evaluate(msg: Message, context: Context):
 
     num_features, num_classes = get_num_features_classes_from_local_csv(
         partition_id=partition_id,
+        num_partitions=num_partitions,
         mode=partition_mode,
         dirichlet_alpha=dirichlet_alpha,
         data_root=data_root,

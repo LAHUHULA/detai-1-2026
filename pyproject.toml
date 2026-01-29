@@ -34,17 +34,17 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-exp-id = "exp_mlp_iid_N11"          # đổi tên tuỳ run
-num-server-rounds = 5
-num-clients = 6
+exp-id = "exp_mlp_non-iid_N3_v1"          # đổi tên tuỳ run
+num-server-rounds = 10
+num-clients = 3
 fraction-train = 1.0
 local-epochs = 1
-lr = 0.001
+lr = 1e-4
 batch-size = 256
 
 # ===== model / partition =====
 model-name = "mlp"                # "mlp" | "cnn1d" | "cnn_bilstm"
-partition-mode = "iid"            # "iid" | "dirichlet"
+partition-mode = "dirichlet"            # "iid" | "dirichlet"
 dirichlet-alpha = 0.3             # chỉ dùng nếu partition-mode="dirichlet"
 
 # ===== dataset (already MinMax scaled -> DO NOT rescale in code) =====
@@ -78,7 +78,7 @@ options.num-supernodes = 4
 [tool.flwr.federations.remote-federation]
 #address = "<SUPERLINK-ADDRESS>:<PORT>"
 #insecure = true  # Remove this line to enable TLS
-#address = "192.168.137.1:9093"
+#address = "192.168.137.1:9092"
 address = "192.168.0.107:9093"
 insecure = true
 # root-certificates = "<PATH/TO/ca.crt>"  # For TLS setup

@@ -2,15 +2,119 @@ import time
 import json
 import csv
 from pathlib import Path
+import os
+from typing import Any, Dict, Optional
 
 import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context
 from flwr.serverapp import Grid, ServerApp
-from flwr.serverapp.strategy import FedAvg
+from flwr.serverapp.strategy import FedAvg, FedAvgM
 
 from ddos_attack.task import build_model, load_centralized_testloader, test as test_fn
 
 app = ServerApp()
+
+# ---- ADD: FedAvg subclass to run centralized test each round ----
+class ServerTestFedAvg(FedAvg):
+    def __init__(
+        self,
+        *args,
+        model_name: str,
+        num_features: int,
+        num_classes: int,
+        batch_size: int,
+        test_csv_path: str,
+        output_dir: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.model_name = model_name
+        self.num_features = int(num_features)
+        self.num_classes = int(num_classes)
+        self.batch_size = int(batch_size)
+
+        # output dir (prefer env OUTPUT_DIR -> outputs/<exp_id>)
+        if output_dir and str(output_dir).strip():
+            self.out_dir = Path(output_dir).expanduser().resolve()
+        else:
+            self.out_dir = (Path(__file__).resolve().parent.parent / "outputs" / "default").resolve()
+
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.csv_path = self.out_dir / "global_test_per_round.csv"
+        self._header_written = self.csv_path.exists()
+
+        # Prepare once
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.test_csv_path = str(test_csv_path)
+        self.testloader = load_centralized_testloader(self.test_csv_path, batch_size=self.batch_size)
+
+    def _append_csv(self, row: Dict[str, Any]) -> None:
+        # write header once
+        if not self._header_written:
+            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                w.writeheader()
+                w.writerow(row)
+            self._header_written = True
+        else:
+            # keep existing header stable
+            with open(self.csv_path, "r", encoding="utf-8") as f:
+                header = f.readline().strip().split(",")
+            for k in header:
+                row.setdefault(k, None)
+            with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=header)
+                w.writerow(row)
+
+    def _server_test(self, server_round: int, arrays_record) -> None:
+        # Build model, load current aggregated weights
+        model = build_model(self.model_name, self.num_features, self.num_classes).to(self.device)
+        state_dict = arrays_record.to_torch_state_dict()
+        model.load_state_dict(state_dict, strict=True)
+        # ---- SAVE MODEL CHECKPOINT PER ROUND ----
+        ckpt_path = self.out_dir / f"{self.model_name}_r{int(server_round)}.pt"
+        # Save state_dict (portable)
+        torch.save(state_dict, ckpt_path)
+
+        # Centralized test on test_final.csv
+        loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = test_fn(
+            model,
+            self.testloader,
+            self.device,
+            num_classes=self.num_classes,
+            criterion=None,
+        )
+
+        row = {
+            "round": int(server_round),
+            "global_test_loss": float(loss),
+            "global_test_acc": float(acc),
+            "precision_macro": float(p_macro),
+            "recall_macro": float(r_macro),
+            "f1_macro": float(f1_macro),
+            "precision_weighted": float(p_w),
+            "recall_weighted": float(r_w),
+            "f1_weighted": float(f1_w),
+            "checkpoint_path": str(ckpt_path),
+        }
+        self._append_csv(row)
+
+    # Hook after aggregation each round
+    def aggregate_train(self, server_round, results, *args, **kwargs):
+        agg = super().aggregate_train(server_round, results, *args, **kwargs)
+
+        # agg is usually (arrays, metrics) in Flower serverapp strategy
+        if isinstance(agg, tuple) and len(agg) == 2:
+            arrays_record, _ = agg
+        else:
+            arrays_record = agg
+
+        # Only test if we actually have a model
+        if arrays_record is not None:
+            self._server_test(server_round=int(server_round), arrays_record=arrays_record)
+
+        return agg
 
 
 def _ensure_dir(p: Path) -> Path:
@@ -65,12 +169,18 @@ def main(grid: Grid, context: Context) -> None:
     initial_arrays = ArrayRecord(global_model.state_dict())
 
     # Start FL
-    strategy = FedAvg(
+    strategy = ServerTestFedAvg(
         fraction_train=fraction_train,
         fraction_evaluate=fraction_train,
         min_train_nodes=num_clients,
         min_evaluate_nodes=num_clients,
         min_available_nodes=num_clients,
+        model_name=model_name,
+        num_features=num_features,
+        num_classes=num_classes,
+        batch_size=batch_size,
+        test_csv_path=server_test_csv,
+        output_dir=str(out_dir),
     )
     t0 = time.perf_counter()
     result = strategy.start(

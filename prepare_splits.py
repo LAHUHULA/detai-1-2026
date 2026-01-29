@@ -9,8 +9,8 @@ DATA_DIR = PROJECT_ROOT / "data"
 TRAIN = DATA_DIR / "train_final.csv"
 
 OUT_BASE = DATA_DIR / "clients"
-N_CLIENTS_LIST = [3, 5, 7]   # sẽ tạo iid_n3, iid_n5, iid_n7
-ALPHAS = [0.3, 0.5]          # sẽ tạo dirichlet_a0.3_n3... và a0.5...
+N_CLIENTS_LIST = [7]   # sẽ tạo iid_n3, iid_n5, iid_n7
+ALPHAS = [0.7]          # sẽ tạo dirichlet_a0.3_n3... và a0.5...
 SEED = 42
 
 EPS = 1e-12
@@ -345,20 +345,20 @@ if __name__ == "__main__":
     df, label_col, y_raw = load_train()
 
     # 1) IID for N=3,5,7
-    for n in N_CLIENTS_LIST:
-        iid_dir = split_iid(df, n_clients=n)
-        report_splits(df, label_col, iid_dir, n_clients=n, save_csv=True)
+    # for n in N_CLIENTS_LIST:
+    #     iid_dir = split_iid(df, n_clients=n)
+    #     report_splits(df, label_col, iid_dir, n_clients=n, save_csv=True)
 
-        # optional plot
-        show_partition_distribution(
-            out_dir=iid_dir,
-            label_col=label_col,
-            num_partitions=n,
-            top_k_classes=13,
-            plot=True,
-            save_path=iid_dir / "_partition_distribution.png",
-            normalize="percent",
-        )
+    #     # optional plot
+    #     show_partition_distribution(
+    #         out_dir=iid_dir,
+    #         label_col=label_col,
+    #         num_partitions=n,
+    #         top_k_classes=13,
+    #         plot=True,
+    #         save_path=iid_dir / "_partition_distribution.png",
+    #         normalize="percent",
+    #     )
 
     # 2) Dirichlet for each alpha and each N
     for alpha in ALPHAS:

@@ -83,89 +83,146 @@ def _load_label_map_required() -> None:
 # 1) Models
 # ============================================================
 
+# class MLPNet(nn.Module):
+#     def __init__(self, num_features: int, num_classes: int):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(num_features, 256),
+#             nn.BatchNorm1d(256),
+#             nn.ReLU(),
+#             nn.Dropout(0.15),
+
+#             nn.Linear(256, 128),
+#             nn.BatchNorm1d(128),
+#             nn.ReLU(),
+#             nn.Dropout(0.10),
+
+#             nn.Linear(128, num_classes),
+#         )
+
+#     def forward(self, x):
+#         return self.net(x)
+
+
 class MLPNet(nn.Module):
+    """
+    DNN Model mapped exactly from the research paper:
+    - Hidden layers: 64, 64, 32
+    - Activation: ReLU
+    - Regularization: Dropout 0.3
+    - No BatchNorm (as per author's DNN description)
+    """
     def __init__(self, num_features: int, num_classes: int):
         super().__init__()
+
         self.net = nn.Sequential(
-            nn.Linear(num_features, 256),
-            nn.BatchNorm1d(256),
+            # Layer 1: 64 neurons
+            nn.Linear(num_features, 64),
             nn.ReLU(),
-            nn.Dropout(0.25),
+            nn.Dropout(0.3),
 
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
+            # Layer 2: 64 neurons
+            nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Dropout(0.20),
+            nn.Dropout(0.3),
 
-            nn.Linear(128, num_classes),
+            # Layer 3: 32 neurons
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            # Output Layer [cite: 334, 335]
+            nn.Linear(32, num_classes)
         )
 
     def forward(self, x):
+        # Flatten input if necessary
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
         return self.net(x)
-
-
-class CNN1DNet(nn.Module):
-    def __init__(self, num_features: int, num_classes: int):
+    
+class CrossLayer(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        self.conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(32)
-        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.pool = nn.AdaptiveMaxPool1d(1)
+        self.w = nn.Parameter(torch.randn(dim))
+        self.b = nn.Parameter(torch.zeros(dim))
 
-        self.fc1 = nn.Linear(64, 64)
-        self.dropout = nn.Dropout(0.30)
-        self.fc2 = nn.Linear(64, num_classes)
+    def forward(self, x0, x):
+        # x_{l+1} = x0 * (w^T x_l) + b + x_l
+        # x0, x: [B, D]
+        wx = torch.sum(x * self.w, dim=1, keepdim=True)  # [B, 1]
+        return x0 * wx + self.b + x
 
-    def forward(self, x):
-        if x.dim() == 2:
-            x = x.unsqueeze(1)  # [B, 1, F]
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.pool(x).squeeze(-1)  # [B, 64]
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        return self.fc2(x)
-
-
-class CNNBiLSTMNet(nn.Module):
-    def __init__(self, num_features: int, num_classes: int):
+class DCNLiteNet(nn.Module):
+    def __init__(self, num_features: int, num_classes: int, dim=128, num_cross=2, dropout=0.1):
         super().__init__()
-        self.conv1 = nn.Conv1d(1, 64, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool1d(kernel_size=2)
-
-        self.lstm = nn.LSTM(
-            input_size=128,
-            hidden_size=64,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True,
+        self.embed = nn.Sequential(
+            nn.Linear(num_features, dim),
+            nn.LayerNorm(dim),
         )
-        self.dropout = nn.Dropout(0.30)
-        self.fc = nn.Linear(64 * 2, num_classes)
+        self.cross = nn.ModuleList([CrossLayer(dim) for _ in range(num_cross)])
+        self.deep = nn.Sequential(
+            nn.Linear(dim, 128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 64), nn.ReLU()
+        )
+        self.fc = nn.Linear(dim + 64, num_classes)
 
     def forward(self, x):
-        x = x.unsqueeze(1)            # [B, 1, F]
-        x = F.relu(self.conv1(x))     # [B, 64, F]
-        x = F.relu(self.conv2(x))     # [B, 128, F]
-        x = self.pool(x)              # [B, 128, F/2]
-        x = x.permute(0, 2, 1)        # [B, F/2, 128]
-        out, _ = self.lstm(x)         # [B, F/2, 128]
-        out = out[:, -1, :]           # [B, 128]
-        out = self.dropout(out)
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+        x = self.embed(x)     # [B, dim]
+        x0 = x
+        xc = x
+        for layer in self.cross:
+            xc = layer(x0, xc)
+        xd = self.deep(x)
+        out = torch.cat([xc, xd], dim=1)
         return self.fc(out)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, dim=128, dropout=0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.ln1 = nn.LayerNorm(dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.ln2 = nn.LayerNorm(dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = F.relu(self.ln1(self.fc1(x)))
+        h = self.drop(h)
+        h = self.ln2(self.fc2(h))
+        return F.relu(x + h)
+
+class TabResNet(nn.Module):
+    def __init__(self, num_features: int, num_classes: int, dim=128, depth=3, dropout=0.1):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Linear(num_features, dim),
+            nn.LayerNorm(dim),
+            nn.ReLU(),
+        )
+        self.blocks = nn.Sequential(*[ResBlock(dim, dropout) for _ in range(depth)])
+        self.head = nn.Linear(dim, num_classes)
+
+    def forward(self, x):
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+        x = self.stem(x)
+        x = self.blocks(x)
+        return self.head(x)
 
 
 def build_model(model_name: str, num_features: int, num_classes: int) -> nn.Module:
     mn = model_name.lower().strip()
     if mn == "mlp":
         return MLPNet(num_features, num_classes)
-    if mn == "cnn1d":
-        return CNN1DNet(num_features, num_classes)
-    if mn in ["cnn_bilstm", "cnn-bilstm", "cnn_bi_lstm"]:
-        return CNNBiLSTMNet(num_features, num_classes)
-    raise ValueError(f"Unknown model_name='{model_name}'. Use one of: mlp, cnn1d, cnn_bilstm")
+    if mn == "dcn-lite":
+        return DCNLiteNet(num_features, num_classes)
+    if mn in ["tab-res-net", "tab_res_net", "tabresnet"]:
+        return TabResNet(num_features, num_classes)
+    raise ValueError(f"Unknown model_name='{model_name}'. Use one of: mlp, dcn-lite, tab-res-net")
 
 
 # ============================================================
@@ -319,7 +376,12 @@ def train(net, trainloader, epochs, lr, device, num_classes: int):
     w = compute_class_weights_from_labels(y_np, int(num_classes)).to(device)
     criterion = nn.CrossEntropyLoss(weight=w)
 
-    optimizer = torch.optim.Adam(net.parameters(), lr=float(lr))
+    # optimizer = torch.optim.Adam(net.parameters(), lr=float(lr))
+    optimizer = torch.optim.AdamW(
+        net.parameters(),
+        lr=float(lr),
+        weight_decay=1e-4
+    )
 
     net.train()
     total_loss = 0.0
