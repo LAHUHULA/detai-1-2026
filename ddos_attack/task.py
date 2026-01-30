@@ -364,7 +364,16 @@ def compute_class_weights_from_labels(labels: np.ndarray, num_classes: int) -> t
     return torch.tensor(weights, dtype=torch.float32)
 
 
-def train(net, trainloader, epochs, lr, device, num_classes: int):
+def train(
+    net,
+    trainloader,
+    epochs,
+    lr,
+    device,
+    num_classes: int,
+    proximal_mu: float = 0.0,
+    global_params: dict | None = None,
+    ):
     net.to(device)
 
     # local class weights from local train data (robust for non-IID)
@@ -394,6 +403,16 @@ def train(net, trainloader, epochs, lr, device, num_classes: int):
 
             optimizer.zero_grad()
             loss = criterion(net(x), y)
+            # =======================
+            # FedProx proximal term
+            # =======================
+            if proximal_mu > 0.0 and global_params is not None:
+                prox_term = 0.0
+                for name, p in net.named_parameters():
+                    p0 = global_params[name]
+                    prox_term += torch.sum((p - p0) ** 2)
+                loss = loss + 0.5 * proximal_mu * prox_term
+            # =======================
             loss.backward()
             optimizer.step()
 

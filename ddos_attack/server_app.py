@@ -8,14 +8,14 @@ from typing import Any, Dict, Optional
 import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context
 from flwr.serverapp import Grid, ServerApp
-from flwr.serverapp.strategy import FedAvg, FedAvgM
+from flwr.serverapp.strategy import FedAvg, FedAvgM, FedProx
 
 from ddos_attack.task import build_model, load_centralized_testloader, test as test_fn
 
 app = ServerApp()
 
 # ---- ADD: FedAvg subclass to run centralized test each round ----
-class ServerTestFedAvg(FedAvg):
+class ServerTestFedProx(FedProx):
     def __init__(
         self,
         *args,
@@ -169,12 +169,13 @@ def main(grid: Grid, context: Context) -> None:
     initial_arrays = ArrayRecord(global_model.state_dict())
 
     # Start FL
-    strategy = ServerTestFedAvg(
+    strategy = ServerTestFedProx(
         fraction_train=fraction_train,
         fraction_evaluate=fraction_train,
         min_train_nodes=num_clients,
         min_evaluate_nodes=num_clients,
         min_available_nodes=num_clients,
+        proximal_mu=0.1,
         model_name=model_name,
         num_features=num_features,
         num_classes=num_classes,
@@ -186,7 +187,10 @@ def main(grid: Grid, context: Context) -> None:
     result = strategy.start(
         grid=grid,
         initial_arrays=initial_arrays,
-        train_config=ConfigRecord({"lr": lr}),
+        train_config=ConfigRecord({
+            "lr": lr,
+            "proximal_mu": 0.05,
+        }),
         num_rounds=num_rounds,
     )
     t1 = time.perf_counter()

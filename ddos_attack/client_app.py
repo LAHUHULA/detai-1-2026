@@ -36,6 +36,8 @@ def train(msg: Message, context: Context):
     partition_id = int(context.node_config["partition-id"])
     num_partitions = int(context.node_config["num-partitions"])
 
+    proximal_mu = float(msg.content["config"].get("proximal_mu", 0.0))
+
     # infer model input/output from local CSV (avoid global train_final)
     num_features, num_classes = get_num_features_classes_from_local_csv(
         partition_id=partition_id,
@@ -47,6 +49,11 @@ def train(msg: Message, context: Context):
 
     model = build_model(model_name, num_features, num_classes)
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
+    global_params = {
+        k: v.detach().clone()
+        for k, v in model.state_dict().items()
+    }
+
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -73,6 +80,8 @@ def train(msg: Message, context: Context):
         lr=lr,
         device=device,
         num_classes=num_classes,
+        proximal_mu=proximal_mu,
+        global_params=global_params,
     )
 
     # benchmark after
