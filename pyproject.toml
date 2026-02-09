@@ -34,18 +34,18 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-exp-id = "exp_mlp_iid_N11"          # đổi tên tuỳ run
+exp-id = "exp_mlp_non-iid_0.1_N7_5_2_2026_v3"          # đổi tên tuỳ run
 num-server-rounds = 5
-num-clients = 6
+num-clients = 7
 fraction-train = 1.0
 local-epochs = 1
-lr = 0.001
+lr = 3e-3
 batch-size = 256
 
 # ===== model / partition =====
-model-name = "mlp"                # "mlp" | "cnn1d" | "cnn_bilstm"
-partition-mode = "iid"            # "iid" | "dirichlet"
-dirichlet-alpha = 0.3             # chỉ dùng nếu partition-mode="dirichlet"
+model-name = "mlp"                # "mlp" | "dcn-lite" | "tab-res-net" | "tinymlp"
+partition-mode = "dirichlet"            # "iid" | "dirichlet"
+dirichlet-alpha = 0.1           # chỉ dùng nếu partition-mode="dirichlet"
 
 # ===== dataset (already MinMax scaled -> DO NOT rescale in code) =====
 num-features = 20
@@ -58,7 +58,7 @@ data-root = "~/projects/ddos-attack/data"
 
 # Centralized test (server-side on PC)
 do-centralized-test = true
-server-test-csv = "C:/Users/lanh2/Documents/HocTap/NamHoc_2023_2024/luanvan/flower/ddos-attack/data/test_final.csv"
+server-test-csv = "C:/Users/dangn/OneDrive/Desktop/flower/ddos-attack/data/test_final.csv"
 
 # Inference benchmark (run separately on Pi after FL)
 infer-bench-csv = "~/projects/ddos-attack/data/infer_bench.csv"
@@ -78,7 +78,8 @@ options.num-supernodes = 4
 [tool.flwr.federations.remote-federation]
 #address = "<SUPERLINK-ADDRESS>:<PORT>"
 #insecure = true  # Remove this line to enable TLS
-#address = "192.168.137.1:9093"
-address = "192.168.0.107:9093"
+#address = "192.168.137.1:9092"
+#address = "192.168.0.107:9093"
+address = "192.168.0.10:9093"
 insecure = true
 # root-certificates = "<PATH/TO/ca.crt>"  # For TLS setup
