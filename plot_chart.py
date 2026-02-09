@@ -102,15 +102,14 @@ def plot_metric_vs_round_for_clients(
 
 def main():
     plot_metric_vs_round_for_clients(
-        csv_3_clients="outputs\exp_mlp_non-iid_0.3_N7_v4\global_test_per_round.csv",
-        csv_5_clients="outputs\exp_dcn-lite_non-iid_0.3_N7_v4\global_test_per_round.csv",
-        csv_7_clients="outputs\exp_tab-res-net_non-iid_0.3_N7_v4\global_test_per_round.csv",
+        csv_3_clients="outputs\exp_mlp_non-iid_0.1_N3_v1\global_test_per_round.csv",
+        csv_5_clients="outputs\exp_dcn-lite_non-iid_0.1_N3_v1\global_test_per_round.csv",
+        csv_7_clients="outputs\exp_tab-res-net_non-iid_0.1_N3_v1\global_test_per_round.csv",
         metric="f1_macro",
         y_label="F1-macro",
-        y_lim=(0.80, 0.95),
-        out_path="charts_outputs/figs/non-iid-0.3-20-round-v4.png"
+        y_lim=(0.60, 0.90),
+        out_path="charts_outputs/figs/non-iid-0.1-10-round-v1.png"
     )
 
 if __name__ == "__main__":
     main()
-

@@ -83,103 +83,133 @@ def _load_label_map_required() -> None:
 # 1) Models
 # ============================================================
 
-# class MLPNet(nn.Module):
-#     def __init__(self, num_features: int, num_classes: int):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(num_features, 256),
-#             nn.BatchNorm1d(256),
-#             nn.ReLU(),
-#             nn.Dropout(0.15),
+class TinyMLP(nn.Module):
+  def __init__(self, num_features:int, num_classes:int, dropout:float=0.15):
+    super().__init__()
+    self.net = nn.Sequential(
+        nn.Linear(num_features, 64),
+        nn.BatchNorm1d(64),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(64, 64),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(64, num_classes)
+    )
 
-#             nn.Linear(256, 128),
-#             nn.BatchNorm1d(128),
-#             nn.ReLU(),
-#             nn.Dropout(0.10),
+  def forward(self, x):
+    return self.net(x)
 
-#             nn.Linear(128, num_classes),
-#         )
-
-#     def forward(self, x):
-#         return self.net(x)
-
-
+# ============================================================
+# 1) MLPNet (CHỈNH) - giảm dropout + thêm LayerNorm để ổn định FL
+#    - Thay đổi chính:
+#      [CHANGE] dropout: 0.3 -> 0.1 (hoặc 0.2)
+#      [ADD] LayerNorm sau Linear
+# ============================================================
 class MLPNet(nn.Module):
     """
-    DNN Model mapped exactly from the research paper:
-    - Hidden layers: 64, 64, 32
-    - Activation: ReLU
-    - Regularization: Dropout 0.3
-    - No BatchNorm (as per author's DNN description)
+    MLP ổn định hơn trong Federated Learning (non-IID) nhờ LayerNorm.
     """
-    def __init__(self, num_features: int, num_classes: int):
+    def __init__(self, num_features: int, num_classes: int, dropout: float = 0.1):  # [CHANGE] default dropout
         super().__init__()
 
         self.net = nn.Sequential(
-            # Layer 1: 64 neurons
             nn.Linear(num_features, 64),
+            nn.LayerNorm(64),          # [ADD]
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout),       # [CHANGE]
 
-            # Layer 2: 64 neurons
             nn.Linear(64, 64),
+            nn.LayerNorm(64),          # [ADD]
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout),       # [CHANGE]
 
-            # Layer 3: 32 neurons
             nn.Linear(64, 32),
+            nn.LayerNorm(32),          # [ADD]
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout),       # [CHANGE]
 
-            # Output Layer [cite: 334, 335]
             nn.Linear(32, num_classes)
         )
 
     def forward(self, x):
-        # Flatten input if necessary
         if x.dim() > 2:
             x = x.view(x.size(0), -1)
         return self.net(x)
-    
+
+
+# ============================================================
+# 2) DCN-Lite (CHỈNH) - giảm độ "gắt" của cross + dropout nhẹ sau cross
+#    - Thay đổi chính:
+#      [CHANGE] num_cross: 2 -> 1  (mặc định 1 cho ổn định)
+#      [OPTION] dim: 128 -> 64 (nếu muốn ổn định hơn nữa)
+#      [ADD] dropout sau mỗi cross layer output
+# ============================================================
 class CrossLayer(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        # Giữ init như bạn đang làm; nếu muốn ổn định hơn có thể đổi init Xavier,
+        # nhưng ở đây mình không bắt buộc để bạn thay ít nhất.
         self.w = nn.Parameter(torch.randn(dim))
         self.b = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x0, x):
-        # x_{l+1} = x0 * (w^T x_l) + b + x_l
-        # x0, x: [B, D]
         wx = torch.sum(x * self.w, dim=1, keepdim=True)  # [B, 1]
         return x0 * wx + self.b + x
 
+
 class DCNLiteNet(nn.Module):
-    def __init__(self, num_features: int, num_classes: int, dim=128, num_cross=2, dropout=0.1):
+    def __init__(
+        self,
+        num_features: int,
+        num_classes: int,
+        dim: int = 128,
+        num_cross: int = 1,          # [CHANGE] 2 -> 1 (ổn định hơn cho non-IID)
+        dropout: float = 0.1,
+        cross_dropout: float = 0.05  # [ADD] dropout nhẹ cho nhánh cross
+    ):
         super().__init__()
         self.embed = nn.Sequential(
             nn.Linear(num_features, dim),
             nn.LayerNorm(dim),
         )
+
         self.cross = nn.ModuleList([CrossLayer(dim) for _ in range(num_cross)])
+        self.cross_drop = nn.Dropout(cross_dropout)  # [ADD]
+
         self.deep = nn.Sequential(
-            nn.Linear(dim, 128), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(128, 64), nn.ReLU()
+            nn.Linear(dim, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(),
         )
+
         self.fc = nn.Linear(dim + 64, num_classes)
 
     def forward(self, x):
         if x.dim() > 2:
             x = x.view(x.size(0), -1)
-        x = self.embed(x)     # [B, dim]
+
+        x = self.embed(x)  # [B, dim]
         x0 = x
         xc = x
+
         for layer in self.cross:
             xc = layer(x0, xc)
+            xc = self.cross_drop(xc)  # [ADD] giúp nhánh cross bớt dao động
+
         xd = self.deep(x)
         out = torch.cat([xc, xd], dim=1)
         return self.fc(out)
 
 
+# ============================================================
+# 3) TabResNet (TUỲ CHỌN CHỈNH NHẸ) - tăng depth hoặc giảm dropout
+#    - Thay đổi chính (tuỳ chọn):
+#      [OPTION] depth: 3 -> 4 (tăng năng lực)
+#      [OPTION] dropout: 0.1 -> 0.05 (nếu thấy học hơi ì)
+# ============================================================
 class ResBlock(nn.Module):
     def __init__(self, dim=128, dropout=0.1):
         super().__init__()
@@ -195,8 +225,16 @@ class ResBlock(nn.Module):
         h = self.ln2(self.fc2(h))
         return F.relu(x + h)
 
+
 class TabResNet(nn.Module):
-    def __init__(self, num_features: int, num_classes: int, dim=128, depth=3, dropout=0.1):
+    def __init__(
+        self,
+        num_features: int,
+        num_classes: int,
+        dim=128,
+        depth=3,            # [OPTION] đổi thành 4 nếu muốn
+        dropout=0.1         # [OPTION] đổi thành 0.05 nếu muốn mượt/ít regularize hơn
+    ):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Linear(num_features, dim),
@@ -222,7 +260,9 @@ def build_model(model_name: str, num_features: int, num_classes: int) -> nn.Modu
         return DCNLiteNet(num_features, num_classes)
     if mn in ["tab-res-net", "tab_res_net", "tabresnet"]:
         return TabResNet(num_features, num_classes)
-    raise ValueError(f"Unknown model_name='{model_name}'. Use one of: mlp, dcn-lite, tab-res-net")
+    if mn in ["TinyMLP", "tinymlp", "tiny-mlp"]:
+        return TinyMLP(num_features, num_classes)
+    raise ValueError(f"Unknown model_name='{model_name}'. Use one of: mlp, dcn-lite, tab-res-net, tinymlp")
 
 
 # ============================================================
@@ -310,8 +350,11 @@ def get_num_features_classes_from_local_csv(
 ) -> Tuple[int, int]:
     p = _local_client_csv_path(partition_id, int(num_partitions), mode, dirichlet_alpha, data_root)
     X, y = _load_csv(str(p))
-    return int(X.shape[1]), int(y.max()) + 1
-
+    _load_label_map_required()
+    assert _int_to_label is not None
+    num_features = int(X.shape[1])
+    num_classes = int(len(_int_to_label))
+    return num_features, num_classes
 
 def load_data(
     partition_id: int,
@@ -384,6 +427,7 @@ def train(
 
     w = compute_class_weights_from_labels(y_np, int(num_classes)).to(device)
     criterion = nn.CrossEntropyLoss(weight=w)
+    # criterion = nn.CrossEntropyLoss()
 
     # optimizer = torch.optim.Adam(net.parameters(), lr=float(lr))
     optimizer = torch.optim.AdamW(

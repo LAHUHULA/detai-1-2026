@@ -9,8 +9,8 @@ DATA_DIR = PROJECT_ROOT / "data"
 TRAIN = DATA_DIR / "train_final.csv"
 
 OUT_BASE = DATA_DIR / "clients"
-N_CLIENTS_LIST = [7]   # sẽ tạo iid_n3, iid_n5, iid_n7
-ALPHAS = [0.7]          # sẽ tạo dirichlet_a0.3_n3... và a0.5...
+N_CLIENTS_LIST = [3, 7]   # sẽ tạo iid_n3, iid_n5, iid_n7
+ALPHAS = [0.1]          # sẽ tạo dirichlet_a0.3_n3... và a0.5...
 SEED = 42
 
 EPS = 1e-12
