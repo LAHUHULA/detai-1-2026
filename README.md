@@ -54,4 +54,9 @@ You can run Flower on Docker too! Check out the [Flower with Docker](https://flo
 - ras-pi-5:192.168.0.46
 - ras-pi-6:192.168.0.179
 - ras-pi-7:192.168.0.119
-- 1166583800
+- ras-pi-8:192.168.0.197
+- ras-pi-9:192.168.0.173
+- ras-pi-10:192.168.0.30
+
+25339559
+big0tg
