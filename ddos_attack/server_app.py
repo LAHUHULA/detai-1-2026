@@ -152,7 +152,7 @@ def main(grid: Grid, context: Context) -> None:
 
     model_name = str(cfg.get("model-name", "mlp"))
     num_clients = int(cfg.get("num-clients", 7))
-    num_features = int(cfg.get("num-features", 40))
+    num_features = int(cfg.get("num-features", 39))
     num_classes = int(cfg.get("num-classes", 13))
 
     partition_mode = str(cfg.get("partition-mode", "iid"))
@@ -175,7 +175,7 @@ def main(grid: Grid, context: Context) -> None:
         min_train_nodes=num_clients,
         min_evaluate_nodes=num_clients,
         min_available_nodes=num_clients,
-        proximal_mu=0.00,
+        proximal_mu=0.1,
         model_name=model_name,
         num_features=num_features,
         num_classes=num_classes,
@@ -189,7 +189,7 @@ def main(grid: Grid, context: Context) -> None:
         initial_arrays=initial_arrays,
         train_config=ConfigRecord({
             "lr": lr,
-            "proximal_mu": 0.00,
+            "proximal_mu": 0.1,
         }),
         num_rounds=num_rounds,
     )

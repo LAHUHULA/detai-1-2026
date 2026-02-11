@@ -38,6 +38,7 @@ def train(msg: Message, context: Context):
 
     proximal_mu = float(msg.content["config"].get("proximal_mu", 0.0))
 
+
     # infer model input/output from local CSV (avoid global train_final)
     num_features, num_classes = get_num_features_classes_from_local_csv(
         partition_id=partition_id,
@@ -82,6 +83,9 @@ def train(msg: Message, context: Context):
         num_classes=num_classes,
         proximal_mu=proximal_mu,
         global_params=global_params,
+        loss_type = str(_k(cfg, "loss-type", "ce")),
+        loss_label_smoothing = float(_k(cfg, "loss-label-smoothing", 0.0)),
+        focal_gamma = float(_k(cfg, "focal-gamma", 2.0))
     )
 
     # benchmark after

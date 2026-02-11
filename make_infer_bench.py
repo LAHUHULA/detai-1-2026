@@ -3,7 +3,7 @@ import pandas as pd
 # ===== CONFIG =====
 INPUT_CSV = "data/test_final.csv"
 OUTPUT_CSV = "data/infer_bench.csv"
-N_SAMPLES = 10_000
+N_SAMPLES = 100_000
 RANDOM_SEED = 42
 # ==================
 
