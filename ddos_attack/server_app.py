@@ -15,6 +15,7 @@ from ddos_attack.task import build_model, load_centralized_testloader, test as t
 app = ServerApp()
 
 # ---- ADD: FedAvg subclass to run centralized test each round ----
+# ---- ADD: FedAvg subclass to run centralized test each round ----
 class ServerTestFedProx(FedProx):
     def __init__(
         self,
@@ -33,6 +34,10 @@ class ServerTestFedProx(FedProx):
         self.num_features = int(num_features)
         self.num_classes = int(num_classes)
         self.batch_size = int(batch_size)
+
+        # ==== [ADD] time accumulators for "FL core time" estimation
+        self.server_test_time_total_s: float = 0.0
+        self.server_test_time_by_round: dict[int, float] = {}
 
         # output dir (prefer env OUTPUT_DIR -> outputs/<exp_id>)
         if output_dir and str(output_dir).strip():
@@ -68,16 +73,19 @@ class ServerTestFedProx(FedProx):
                 w.writerow(row)
 
     def _server_test(self, server_round: int, arrays_record) -> None:
+        # ==== [ADD] measure server-side test overhead per round
+        _t0 = time.perf_counter()
+
         # Build model, load current aggregated weights
         model = build_model(self.model_name, self.num_features, self.num_classes).to(self.device)
         state_dict = arrays_record.to_torch_state_dict()
         model.load_state_dict(state_dict, strict=True)
+
         # ---- SAVE MODEL CHECKPOINT PER ROUND ----
         ckpt_path = self.out_dir / f"{self.model_name}_r{int(server_round)}.pt"
-        # Save state_dict (portable)
         torch.save(state_dict, ckpt_path)
 
-        # Centralized test on test_final.csv
+        # Centralized test on test CSV
         loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = test_fn(
             model,
             self.testloader,
@@ -98,7 +106,23 @@ class ServerTestFedProx(FedProx):
             "f1_weighted": float(f1_w),
             "checkpoint_path": str(ckpt_path),
         }
+
+        # ==== [ADD] dt_no_csv: time up to (and including) inference + ckpt save, excluding CSV write
+        _t1 = time.perf_counter()
+        dt_no_csv = float(_t1 - _t0)
+        row["server_test_time_s"] = dt_no_csv  # stays in the per-round CSV
+
+        # ==== [ADD] measure CSV write time separately, but include it in total test overhead accumulator
+        _t2 = time.perf_counter()
         self._append_csv(row)
+        _t3 = time.perf_counter()
+        dt_csv = float(_t3 - _t2)
+
+        # ==== [ADD] accumulate total server-test overhead (includes csv write)
+        dt_total = dt_no_csv + dt_csv
+        self.server_test_time_total_s += dt_total
+        self.server_test_time_by_round[int(server_round)] = dt_total
+
 
     # Hook after aggregation each round
     def aggregate_train(self, server_round, results, *args, **kwargs):
@@ -115,6 +139,7 @@ class ServerTestFedProx(FedProx):
             self._server_test(server_round=int(server_round), arrays_record=arrays_record)
 
         return agg
+
 
 
 def _ensure_dir(p: Path) -> Path:
@@ -175,7 +200,7 @@ def main(grid: Grid, context: Context) -> None:
         min_train_nodes=num_clients,
         min_evaluate_nodes=num_clients,
         min_available_nodes=num_clients,
-        proximal_mu=0.1,
+        proximal_mu=0.01,
         model_name=model_name,
         num_features=num_features,
         num_classes=num_classes,
@@ -189,7 +214,7 @@ def main(grid: Grid, context: Context) -> None:
         initial_arrays=initial_arrays,
         train_config=ConfigRecord({
             "lr": lr,
-            "proximal_mu": 0.1,
+            "proximal_mu": 0.01,
         }),
         num_rounds=num_rounds,
     )
@@ -203,6 +228,11 @@ def main(grid: Grid, context: Context) -> None:
     # Estimate comm/time
     total_time = float(t1 - t0)
     avg_round_time = total_time / max(num_rounds, 1)
+    # ==== [ADD] estimate "FL core time" by subtracting server_test time
+    server_test_time_total_s = float(getattr(strategy, "server_test_time_total_s", 0.0))
+    fl_core_time_s = max(0.0, float(total_time - server_test_time_total_s))
+    avg_round_fl_core_time_s = fl_core_time_s / max(num_rounds, 1)
+    avg_round_server_test_time_s = server_test_time_total_s / max(num_rounds, 1)
     model_bytes = sum(v.numel() * v.element_size() for v in state_dict.values() if torch.is_tensor(v))
     clients_per_round = max(1, int(round(fraction_train * num_clients)))
     est_comm_per_round_mib = float((model_bytes * 2 * clients_per_round) / (1024.0 ** 2))
@@ -245,6 +275,11 @@ def main(grid: Grid, context: Context) -> None:
         "num_classes": num_classes,
         "total_time_s": total_time,
         "avg_round_time_s": float(avg_round_time),
+        # ==== [ADD] time breakdown
+        "server_test_time_total_s": float(server_test_time_total_s),
+        "fl_core_time_s": float(fl_core_time_s),
+        "avg_round_fl_core_time_s": float(avg_round_fl_core_time_s),
+        "avg_round_server_test_time_s": float(avg_round_server_test_time_s),
         "model_size_kib": float(model_bytes / 1024.0),
         "est_comm_per_round_mib": est_comm_per_round_mib,
         **centralized,

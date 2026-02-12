@@ -34,8 +34,8 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-exp-id = "exp_tabresnet_non-iid_0.3_N10_fed_prox_0.1_ce_11_2_2026_v1"          # đổi tên tuỳ run
-num-server-rounds = 15
+exp-id = "exp_tabresnet_non-iid_0.1_N10_fed_prox_0.01_ce_12_2_2026_v2"          # đổi tên tuỳ run
+num-server-rounds = 50
 num-clients = 10
 fraction-train = 1.0
 local-epochs = 1
@@ -45,7 +45,7 @@ batch-size = 256
 # ===== model / partition =====
 model-name = "tab-res-net"                # "mlp" | "dcn-lite" | "tab-res-net" | "tinymlp"
 partition-mode = "dirichlet"            # "iid" | "dirichlet"
-dirichlet-alpha = 0.3           # chỉ dùng nếu partition-mode="dirichlet"
+dirichlet-alpha = 0.1          # chỉ dùng nếu partition-mode="dirichlet"
 
 # ===== Loss function ====
 loss-type = "ce"          # options: "ce", "focal"
