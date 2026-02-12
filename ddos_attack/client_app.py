@@ -35,11 +35,8 @@ def train(msg: Message, context: Context):
 
     partition_id = int(context.node_config["partition-id"])
     num_partitions = int(context.node_config["num-partitions"])
-
     proximal_mu = float(msg.content["config"].get("proximal_mu", 0.0))
 
-
-    # infer model input/output from local CSV (avoid global train_final)
     num_features, num_classes = get_num_features_classes_from_local_csv(
         partition_id=partition_id,
         num_partitions=num_partitions,
@@ -48,32 +45,30 @@ def train(msg: Message, context: Context):
         data_root=data_root,
     )
 
-    model = build_model(model_name, num_features, num_classes)
-    model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
-    global_params = {
-        k: v.detach().clone()
-        for k, v in model.state_dict().items()
-    }
-
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    trainloader, _ = load_data(
+    # Lấy thêm class_weights từ hàm load_data
+    trainloader, _, class_weights = load_data(
         partition_id=partition_id,
         num_partitions=num_partitions,
         batch_size=batch_size,
         mode=partition_mode,
         dirichlet_alpha=dirichlet_alpha,
         data_root=data_root,
+        num_classes=num_classes
     )
 
-    # benchmark before
+    model = build_model(model_name, num_features, num_classes)
+    model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
+    global_params = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
     t0 = time.perf_counter()
     cpu0, ram0 = get_cpu_ram_percent()
     temp0 = _try_read_pi_temp_c()
     tx0, rx0 = get_net_bytes()
 
+    # Truyền class_weights vào hàm train
     train_loss = train_fn(
         model,
         trainloader,
@@ -81,6 +76,7 @@ def train(msg: Message, context: Context):
         lr=lr,
         device=device,
         num_classes=num_classes,
+        class_weights=class_weights,
         proximal_mu=proximal_mu,
         global_params=global_params,
         loss_type = str(_k(cfg, "loss-type", "ce")),
@@ -88,13 +84,11 @@ def train(msg: Message, context: Context):
         focal_gamma = float(_k(cfg, "focal-gamma", 2.0))
     )
 
-    # benchmark after
     t1 = time.perf_counter()
     cpu1, ram1 = get_cpu_ram_percent()
     temp1 = _try_read_pi_temp_c()
     tx1, rx1 = get_net_bytes()
 
-    # model size/params
     param_count = sum(p.numel() for p in model.parameters())
     model_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
 

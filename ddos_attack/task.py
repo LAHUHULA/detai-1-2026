@@ -314,23 +314,19 @@ def load_data(
     mode: str = "iid",
     dirichlet_alpha: float = 0.5,
     data_root: str | None = None,
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    Real FL: each client reads its own CSV partition:
-      {data_root}/clients/iid/client_{id}.csv
-      {data_root}/clients/dirichlet_a{alpha}/client_{id}.csv
-
-    NOTE: CSV is already MinMax scaled -> do NOT apply scaling again.
-    """
+    num_classes: int = 13,
+) -> Tuple[DataLoader, DataLoader, torch.Tensor]:
     local_csv = _local_client_csv_path(int(partition_id), int(num_partitions), mode, float(dirichlet_alpha), data_root)
     if not local_csv.exists():
         raise FileNotFoundError(f"Client CSV not found: {local_csv}")
 
     Xc, yc = _load_csv(str(local_csv))
-    n = len(Xc)
-    if n == 0:
-        raise ValueError(f"Client {partition_id} has 0 samples: {local_csv}")
+    
+    # Tính toán trọng số lớp một lần duy nhất tại đây
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    class_weights = compute_class_weights_from_labels(yc, num_classes).to(device)
 
+    n = len(Xc)
     rng = np.random.RandomState(100 + int(partition_id))
     idx = rng.permutation(n)
     split = max(1, int(0.8 * n))
@@ -343,7 +339,8 @@ def load_data(
 
     train_loader = DataLoader(CSVDataset(X_train, y_train), batch_size=batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(CSVDataset(X_val, y_val), batch_size=batch_size, shuffle=False, drop_last=False)
-    return train_loader, val_loader
+    
+    return train_loader, val_loader, class_weights
 
 
 # ============================================================
@@ -427,6 +424,7 @@ def train(
     lr,
     device,
     num_classes: int,
+    class_weights: torch.Tensor,
     proximal_mu: float = 0.0,
     global_params: dict | None = None,
     loss_type: str = "ce",
@@ -435,23 +433,14 @@ def train(
     ):
     net.to(device)
 
-    # local class weights from local train data (robust for non-IID)
-    all_y = []
-    for batch in trainloader:
-        all_y.append(batch["label"].detach().cpu())
-    y_np = torch.cat(all_y).numpy()
-
-    w = compute_class_weights_from_labels(y_np, int(num_classes)).to(device)
-    # criterion = nn.CrossEntropyLoss(weight=w)
-    # criterion = nn.CrossEntropyLoss()
+    # Sử dụng trọng số đã truyền vào để tạo criterion
     criterion = make_criterion(
         loss_type=loss_type,
-        class_weights=w,  # None if you want no weights
+        class_weights=class_weights, 
         label_smoothing=loss_label_smoothing,
         focal_gamma=focal_gamma,
     )
 
-    # optimizer = torch.optim.Adam(net.parameters(), lr=float(lr))
     optimizer = torch.optim.AdamW(
         net.parameters(),
         lr=float(lr),
@@ -469,16 +458,14 @@ def train(
 
             optimizer.zero_grad()
             loss = criterion(net(x), y)
-            # =======================
-            # FedProx proximal term
-            # =======================
+            
             if proximal_mu > 0.0 and global_params is not None:
                 prox_term = 0.0
                 for name, p in net.named_parameters():
                     p0 = global_params[name]
                     prox_term += torch.sum((p - p0) ** 2)
                 loss = loss + 0.5 * proximal_mu * prox_term
-            # =======================
+
             loss.backward()
             optimizer.step()
 
