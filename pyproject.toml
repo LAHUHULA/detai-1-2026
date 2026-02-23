@@ -65,8 +65,8 @@ data-root = "~/projects/ddos-attack/data"
 
 # Centralized test (server-side on PC)
 do-centralized-test = true
-#server-test-csv = "C:/Users/dangn/OneDrive/Desktop/flower/ddos-attack/data/test_final.csv"
-server-test-csv = "C:/Users/lanh2/Documents/HocTap/NamHoc_2023_2024/luanvan/flower/ddos-attack/data/test_final.csv"
+server-test-csv = "C:/Users/dangn/OneDrive/Desktop/flower/ddos-attack/data/test_final.csv"
+#server-test-csv = "C:/Users/lanh2/Documents/HocTap/NamHoc_2023_2024/luanvan/flower/ddos-attack/data/test_final.csv"
 
 # Inference benchmark (run separately on Pi after FL)
 infer-bench-csv = "~/projects/ddos-attack/data/infer_bench.csv"
@@ -88,6 +88,6 @@ options.num-supernodes = 4
 #insecure = true  # Remove this line to enable TLS
 #address = "192.168.137.1:9092"
 #address = "192.168.0.107:9093"
-address = "192.168.0.107:9093"
+address = "192.168.0.10:9093"
 insecure = true
 # root-certificates = "<PATH/TO/ca.crt>"  # For TLS setup
