@@ -119,9 +119,30 @@ class MLPBlock(nn.Module):
 
 
 # ============================================================
+# Logistic Regression (FL-compatible)
+# ============================================================
+class LogisticRegressionNet(nn.Module):
+    """
+    Logistic Regression implementation in PyTorch.
+    This is effectively a single linear layer, making it very 
+    lightweight for Pi4 and compatible with FedAvg/FedProx.
+    """
+    def __init__(self, num_features: int, num_classes: int):
+        super().__init__()
+        self.linear = nn.Linear(num_features, num_classes)
+
+    def forward(self, x):
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+        # CrossEntropyLoss trong PyTorch sẽ tự tính Softmax, 
+        # nên ở đây chỉ cần trả về kết quả Linear.
+        return self.linear(x)
+
+# ============================================================
 # 1) MLPNet (FL-MLPNet-Lite)
 #    - LN-based MLP, FL-friendly
 # ============================================================
+
 class MLPNet(nn.Module):
     """
     Paper model: FL-MLPNet-Lite
@@ -209,11 +230,13 @@ class TabResNet(nn.Module):
 
 def build_model(model_name: str, num_features: int, num_classes: int) -> nn.Module:
     mn = model_name.lower().strip()
+    if mn == "logistic":
+        return LogisticRegressionNet(num_features, num_classes)
     if mn == "mlp":
         return MLPNet(num_features, num_classes)
     if mn in ["tab-res-net", "tab_res_net", "tabresnet"]:
         return TabResNet(num_features, num_classes)
-    raise ValueError(f"Unknown model_name='{model_name}'. Use one of: mlp, tab-res-net")
+    raise ValueError(f"Unknown model_name='{model_name}'. Use one of: logistic, mlp, tab-res-net")
 
 
 # ============================================================
