@@ -3,6 +3,7 @@ import json
 import csv
 from pathlib import Path
 import os
+import random
 from typing import Any, Dict, Optional
 
 import torch
@@ -20,6 +21,7 @@ class ServerTestFedProx(FedProx):
     def __init__(
         self,
         *args,
+        sampling_plan: dict,
         model_name: str,
         num_features: int,
         num_classes: int,
@@ -30,6 +32,7 @@ class ServerTestFedProx(FedProx):
     ):
         super().__init__(*args, **kwargs)
 
+        self.sampling_plan = sampling_plan
         self.model_name = model_name
         self.num_features = int(num_features)
         self.num_classes = int(num_classes)
@@ -53,6 +56,27 @@ class ServerTestFedProx(FedProx):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.test_csv_path = str(test_csv_path)
         self.testloader = load_centralized_testloader(self.test_csv_path, batch_size=self.batch_size)
+
+    def configure_fit(self, server_round, parameters, client_manager):
+
+        selected_ids = self.sampling_plan.get(str(server_round), [])
+
+        all_clients = list(client_manager.all().values())
+
+        selected_clients = [
+            c for c in all_clients
+            if int(c.cid) in selected_ids
+        ]
+
+        fit_ins = super().configure_fit(server_round, parameters, client_manager)
+
+        if not selected_clients:
+            return []
+
+        # rebuild FitIns with fixed client list
+        base_fitins = fit_ins[0][1] if fit_ins else None
+
+        return [(c, base_fitins) for c in selected_clients]
 
     def _append_csv(self, row: Dict[str, Any]) -> None:
         # write header once
@@ -159,6 +183,25 @@ def _append_csv_row(path: Path, header: list[str], row: dict) -> None:
             w.writeheader()
         w.writerow(row)
 
+def generate_sampling_plan(
+    num_clients: int,
+    fraction_train: float,
+    num_rounds: int,
+    out_path: Path,
+    seed: int = 42,
+):
+    random.seed(seed)
+    clients = list(range(num_clients))
+    plan = {}
+
+    k = max(1, int(num_clients * fraction_train))
+
+    for r in range(1, num_rounds + 1):
+        selected = random.sample(clients, k)
+        plan[str(r)] = selected
+
+    out_path.write_text(json.dumps(plan, indent=2))
+    return plan
 
 @app.main()
 def main(grid: Grid, context: Context) -> None:
@@ -180,6 +223,15 @@ def main(grid: Grid, context: Context) -> None:
     num_features = int(cfg.get("num-features", 39))
     num_classes = int(cfg.get("num-classes", 13))
 
+    sampling_plan_path = out_dir / "sampling_plan.json"
+
+    sampling_plan = generate_sampling_plan(
+        num_clients=num_clients,
+        fraction_train=fraction_train,
+        num_rounds=num_rounds,
+        out_path=sampling_plan_path,
+    )
+
     partition_mode = str(cfg.get("partition-mode", "iid"))
     dirichlet_alpha = float(cfg.get("dirichlet-alpha", 0.5))
 
@@ -195,12 +247,13 @@ def main(grid: Grid, context: Context) -> None:
 
     # Start FL
     strategy = ServerTestFedProx(
+        sampling_plan=sampling_plan,
         fraction_train=fraction_train,
         fraction_evaluate=fraction_train,
-        min_train_nodes=num_clients,
-        min_evaluate_nodes=num_clients,
-        min_available_nodes=num_clients,
-        proximal_mu=0.01,
+        min_train_nodes=3,
+        min_evaluate_nodes=3,
+        min_available_nodes=3,
+        proximal_mu=0.0,
         model_name=model_name,
         num_features=num_features,
         num_classes=num_classes,
@@ -214,7 +267,7 @@ def main(grid: Grid, context: Context) -> None:
         initial_arrays=initial_arrays,
         train_config=ConfigRecord({
             "lr": lr,
-            "proximal_mu": 0.01,
+            "proximal_mu": 0.0,
         }),
         num_rounds=num_rounds,
     )
@@ -293,7 +346,9 @@ def main(grid: Grid, context: Context) -> None:
         "exp_id", "model", "partition_mode", "dirichlet_alpha",
         "num_clients", "num_rounds", "fraction_train", "local_epochs",
         "batch_size", "lr", "num_features", "num_classes",
-        "total_time_s", "avg_round_time_s", "model_size_kib", "est_comm_per_round_mib",
+        "total_time_s", "avg_round_time_s", "server_test_time_total_s", "fl_core_time_s",
+        "avg_round_fl_core_time_s", "avg_round_server_test_time_s", 
+        "model_size_kib", "est_comm_per_round_mib",
         "global_test_loss", "global_test_acc",
         "precision_macro", "recall_macro", "f1_macro",
         "precision_weighted", "recall_weighted", "f1_weighted",

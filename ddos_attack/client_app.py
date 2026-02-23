@@ -148,7 +148,7 @@ def evaluate(msg: Message, context: Context):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    _, valloader = load_data(
+    _, valloader, _ = load_data(
         partition_id=partition_id,
         num_partitions=num_partitions,
         batch_size=batch_size,
