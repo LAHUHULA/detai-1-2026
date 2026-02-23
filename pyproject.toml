@@ -34,18 +34,19 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-exp-id = "exp_tabresnet_non-iid_0.1_N10_fed_prox_0.01_ce_12_2_2026_v2"          # đổi tên tuỳ run
-num-server-rounds = 50
+exp-id = "exp_logistic_iid_N10_iid_fed_avg_ce-ft10_22_2_2026_v1"          # đổi tên tuỳ run
+#exp-id = "test_tab-res-net_avg_3"          # đổi tên tuỳ run
+num-server-rounds = 20
 num-clients = 10
-fraction-train = 1.0
-local-epochs = 1
+fraction-train = 1
+local-epochs = 5
 lr = 1e-3
 batch-size = 256
 
 # ===== model / partition =====
-model-name = "tab-res-net"                # "mlp" | "dcn-lite" | "tab-res-net" | "tinymlp"
-partition-mode = "dirichlet"            # "iid" | "dirichlet"
-dirichlet-alpha = 0.1          # chỉ dùng nếu partition-mode="dirichlet"
+model-name = "logistic"                # "mlp" | "logistic" | "tab-res-net" | ""
+partition-mode = "iid"            # "iid" | "dirichlet"
+dirichlet-alpha = 0.5          # chỉ dùng nếu partition-mode="dirichlet"
 
 # ===== Loss function ====
 loss-type = "ce"          # options: "ce", "focal"
@@ -54,7 +55,7 @@ focal-gamma = 2.0         # only used when loss-type="focal"
 
 
 # ===== dataset (already MinMax scaled -> DO NOT rescale in code) =====
-num-features = 39
+num-features = 25
 num-classes = 13
 
 # Data root OUTSIDE app bundle (important for remote federation)
@@ -64,7 +65,8 @@ data-root = "~/projects/ddos-attack/data"
 
 # Centralized test (server-side on PC)
 do-centralized-test = true
-server-test-csv = "C:/Users/dangn/OneDrive/Desktop/flower/ddos-attack/data/test_final.csv"
+#server-test-csv = "C:/Users/dangn/OneDrive/Desktop/flower/ddos-attack/data/test_final.csv"
+server-test-csv = "C:/Users/lanh2/Documents/HocTap/NamHoc_2023_2024/luanvan/flower/ddos-attack/data/test_final.csv"
 
 # Inference benchmark (run separately on Pi after FL)
 infer-bench-csv = "~/projects/ddos-attack/data/infer_bench.csv"
@@ -86,6 +88,6 @@ options.num-supernodes = 4
 #insecure = true  # Remove this line to enable TLS
 #address = "192.168.137.1:9092"
 #address = "192.168.0.107:9093"
-address = "192.168.0.10:9093"
+address = "192.168.0.107:9093"
 insecure = true
 # root-certificates = "<PATH/TO/ca.crt>"  # For TLS setup
