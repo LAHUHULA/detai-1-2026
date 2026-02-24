@@ -11,6 +11,7 @@ from ddos_attack.task import (
     get_num_features_classes_from_local_csv,
 )
 from ddos_attack.bench_pi import get_cpu_ram_percent, _try_read_pi_temp_c, get_net_bytes, log_round
+from ddos_attack.bench_pi import ResourceMonitor
 
 app = ClientApp()
 
@@ -63,7 +64,11 @@ def train(msg: Message, context: Context):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    monitor = ResourceMonitor(interval=0.5)
+    monitor.start()
+
     t0 = time.perf_counter()
+
     cpu0, ram0 = get_cpu_ram_percent()
     temp0 = _try_read_pi_temp_c()
     tx0, rx0 = get_net_bytes()
@@ -85,6 +90,10 @@ def train(msg: Message, context: Context):
     )
 
     t1 = time.perf_counter()
+
+    monitor.stop()
+    resource_stats = monitor.summary()
+
     cpu1, ram1 = get_cpu_ram_percent()
     temp1 = _try_read_pi_temp_c()
     tx1, rx1 = get_net_bytes()
@@ -103,16 +112,12 @@ def train(msg: Message, context: Context):
         "lr": float(lr),
         "local_samples": int(len(trainloader.dataset)),
         "train_time_s": float(t1 - t0),
-        "cpu_percent_before": cpu0,
-        "ram_percent_before": ram0,
-        "temp_c_before": temp0,
-        "cpu_percent_after": cpu1,
-        "ram_percent_after": ram1,
-        "temp_c_after": temp1,
+        **resource_stats,
         "net_tx_bytes_delta": (tx1 - tx0) if (tx0 >= 0 and tx1 >= 0) else None,
         "net_rx_bytes_delta": (rx1 - rx0) if (rx0 >= 0 and rx1 >= 0) else None,
         "param_count": int(param_count),
         "model_size_kib": float(model_bytes / 1024.0),
+        
     })
 
     model_record = ArrayRecord(model.state_dict())

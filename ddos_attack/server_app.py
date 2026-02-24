@@ -42,6 +42,16 @@ class ServerTestFedProx(FedProx):
         self.server_test_time_total_s: float = 0.0
         self.server_test_time_by_round: dict[int, float] = {}
 
+        # ==== [ADD] round-level train metrics
+        self.round_train_loss: dict[int, float] = {}
+        self.round_fl_core_time: dict[int, float] = {}
+
+        # ==== [FIX] round wall-clock timing
+        self._round_start_time: dict[int, float] = {}
+
+        # ==== [ADD] precise round timing
+        self.round_wall_time: dict[int, float] = {}
+
         # output dir (prefer env OUTPUT_DIR -> outputs/<exp_id>)
         if output_dir and str(output_dir).strip():
             self.out_dir = Path(output_dir).expanduser().resolve()
@@ -58,6 +68,8 @@ class ServerTestFedProx(FedProx):
         self.testloader = load_centralized_testloader(self.test_csv_path, batch_size=self.batch_size)
 
     def configure_fit(self, server_round, parameters, client_manager):
+        # ==== [FIX] mark round start time
+        self._round_start_time[int(server_round)] = time.perf_counter()
 
         selected_ids = self.sampling_plan.get(str(server_round), [])
 
@@ -97,6 +109,10 @@ class ServerTestFedProx(FedProx):
                 w.writerow(row)
 
     def _server_test(self, server_round: int, arrays_record) -> None:
+        # ==== [FIX] compute round wall time here to guarantee availability
+        start_t = self._round_start_time.get(int(server_round))
+        if start_t is not None:
+            self.round_wall_time[int(server_round)] = float(time.perf_counter() - start_t)
         # ==== [ADD] measure server-side test overhead per round
         _t0 = time.perf_counter()
 
@@ -138,6 +154,13 @@ class ServerTestFedProx(FedProx):
 
         # ==== [ADD] measure CSV write time separately, but include it in total test overhead accumulator
         _t2 = time.perf_counter()
+        # ==== [ADD] attach round train loss + fl core time if available
+        if int(server_round) in self.round_train_loss:
+            row["round_train_loss"] = self.round_train_loss[int(server_round)]
+
+        if int(server_round) in self.round_wall_time:
+            row["round_wall_time_s"] = self.round_wall_time[int(server_round)]
+    
         self._append_csv(row)
         _t3 = time.perf_counter()
         dt_csv = float(_t3 - _t2)
@@ -150,21 +173,37 @@ class ServerTestFedProx(FedProx):
 
     # Hook after aggregation each round
     def aggregate_train(self, server_round, results, *args, **kwargs):
+
+        # ---- normal aggregation
         agg = super().aggregate_train(server_round, results, *args, **kwargs)
 
-        # agg is usually (arrays, metrics) in Flower serverapp strategy
+        # ==== [ROUND END MARK + COMPUTE WALL TIME]
+        start_t = self._round_start_time.get(int(server_round))
+
+        if start_t is not None:
+            round_time = float(time.perf_counter() - start_t)
+            self.round_wall_time[int(server_round)] = round_time
+
+        # ---- extract arrays + metrics safely
         if isinstance(agg, tuple) and len(agg) == 2:
-            arrays_record, _ = agg
+            arrays_record, metrics = agg
         else:
             arrays_record = agg
+            metrics = None
 
-        # Only test if we actually have a model
+        if metrics is not None:
+            try:
+                metrics_dict = dict(metrics)
+                train_loss = metrics_dict.get("train_loss")
+                if train_loss is not None:
+                    self.round_train_loss[int(server_round)] = float(train_loss)
+            except Exception:
+                pass
+
         if arrays_record is not None:
             self._server_test(server_round=int(server_round), arrays_record=arrays_record)
 
         return agg
-
-
 
 def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
@@ -338,6 +377,9 @@ def main(grid: Grid, context: Context) -> None:
         **centralized,
         "final_model_path": str(model_path),
     }
+        # ==== [ADD] round-level logs
+    run_summary["round_train_loss"] = strategy.round_train_loss
+    run_summary["round_wall_time_s"] = strategy.round_wall_time
     _save_json(out_dir / "run_summary.json", run_summary)
 
     # Append global summary CSV

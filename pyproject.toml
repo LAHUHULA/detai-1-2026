@@ -34,19 +34,19 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-exp-id = "exp_logistic_iid_N10_iid_fed_avg_ce-ft10_22_2_2026_v1"          # đổi tên tuỳ run
+exp-id = "exp_mlp_non-iid-0.1_N10_fed_avg_ce-ft10_24_2_2026_v1"          # đổi tên tuỳ run
 #exp-id = "test_tab-res-net_avg_3"          # đổi tên tuỳ run
-num-server-rounds = 20
+num-server-rounds = 30
 num-clients = 10
-fraction-train = 1
-local-epochs = 5
-lr = 1e-3
+fraction-train = 0.5
+local-epochs = 3
+lr = 3e-3
 batch-size = 256
 
 # ===== model / partition =====
-model-name = "logistic"                # "mlp" | "logistic" | "tab-res-net" | ""
-partition-mode = "iid"            # "iid" | "dirichlet"
-dirichlet-alpha = 0.5          # chỉ dùng nếu partition-mode="dirichlet"
+model-name = "mlp"                # "mlp" | "logistic" | "tab-res-net" | ""
+partition-mode = "dirichlet"            # "iid" | "dirichlet"
+dirichlet-alpha = 0.1         # chỉ dùng nếu partition-mode="dirichlet"
 
 # ===== Loss function ====
 loss-type = "ce"          # options: "ce", "focal"
@@ -88,6 +88,6 @@ options.num-supernodes = 4
 #insecure = true  # Remove this line to enable TLS
 #address = "192.168.137.1:9092"
 #address = "192.168.0.107:9093"
-address = "192.168.0.10:9093"
+address = "192.168.0.13:9093"
 insecure = true
 # root-certificates = "<PATH/TO/ca.crt>"  # For TLS setup

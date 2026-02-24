@@ -10,7 +10,7 @@ TRAIN = DATA_DIR / "train_final.csv"
 
 OUT_BASE = DATA_DIR / "clients"
 N_CLIENTS_LIST = [10]   # sẽ tạo iid_n3, iid_n5, iid_n7
-ALPHAS = [0.1, 0.5]          # sẽ tạo dirichlet_a0.3_n3... và a0.5...
+ALPHAS = [0.3]          # sẽ tạo dirichlet_a0.3_n3... và a0.5...
 SEED = 42
 
 EPS = 1e-12
