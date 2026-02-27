@@ -121,7 +121,7 @@ def train(msg: Message, context: Context):
     })
 
     model_record = ArrayRecord(model.state_dict())
-    metrics = {"train_loss": float(train_loss), "num-examples": len(trainloader.dataset)}
+    metrics = {"train_loss": float(train_loss), "num-examples": len(trainloader.dataset), "partition-id": int(partition_id),}
     content = RecordDict({"arrays": model_record, "metrics": MetricRecord(metrics)})
     return Message(content=content, reply_to=msg)
 

@@ -67,28 +67,72 @@ class ServerTestFedProx(FedProx):
         self.test_csv_path = str(test_csv_path)
         self.testloader = load_centralized_testloader(self.test_csv_path, batch_size=self.batch_size)
 
-    def configure_fit(self, server_round, parameters, client_manager):
-        # ==== [FIX] mark round start time
+        self.partition_to_node = {}
+
+
+    def configure_train(self, server_round, arrays, config, grid):
+
         self._round_start_time[int(server_round)] = time.perf_counter()
 
-        selected_ids = self.sampling_plan.get(str(server_round), [])
+        selected_partitions = set(
+            int(x) for x in self.sampling_plan.get(str(server_round), [])
+        )
 
-        all_clients = list(client_manager.all().values())
+        print(f"\n========== ROUND {server_round} ==========")
+        print("PLAN:", selected_partitions)
+        print("CURRENT MAP:", self.partition_to_node)
 
-        selected_clients = [
-            c for c in all_clients
-            if int(c.cid) in selected_ids
+        # Lấy messages gốc
+        messages = super().configure_train(server_round, arrays, config, grid)
+
+        # Nếu mapping chưa đủ (round 1), cho tất cả train
+        if len(self.partition_to_node) == 0:
+            print("⚠ Mapping not ready yet. Let all nodes train.")
+            return messages
+
+        selected_node_ids = {
+            self.partition_to_node[p]
+            for p in selected_partitions
+            if p in self.partition_to_node
+        }
+
+        print("SELECTED NODE IDS:", selected_node_ids)
+        print("================================")
+
+        filtered = [
+            msg for msg in messages
+            if msg.metadata.dst_node_id in selected_node_ids
         ]
 
-        fit_ins = super().configure_fit(server_round, parameters, client_manager)
+        return filtered
 
-        if not selected_clients:
-            return []
+    # def configure_fit(self, server_round, parameters, client_manager):
+    #     # ==== [FIX] mark round start time
+    #     self._round_start_time[int(server_round)] = time.perf_counter()
 
-        # rebuild FitIns with fixed client list
-        base_fitins = fit_ins[0][1] if fit_ins else None
+    #     selected_ids = self.sampling_plan.get(str(server_round), [])
 
-        return [(c, base_fitins) for c in selected_clients]
+    #     all_clients = list(client_manager.all().values())
+
+    #     selected_clients = [
+    #         c for c in all_clients
+    #         if int(c.cid) in selected_ids
+    #     ]
+
+    #     fit_ins = super().configure_fit(server_round, parameters, client_manager)
+
+    #     if not selected_clients:
+    #         return []
+
+    #     print(f"\nROUND {server_round}")
+    #     print("PLAN:", selected_ids)
+    #     print("ALL:", [c.cid for c in all_clients])
+    #     print("SELECTED:", [c.cid for c in selected_clients])
+
+    #     # rebuild FitIns with fixed client list
+    #     base_fitins = fit_ins[0][1] if fit_ins else None
+
+    #     return [(c, base_fitins) for c in selected_clients]
 
     def _append_csv(self, row: Dict[str, Any]) -> None:
         # write header once
@@ -171,39 +215,76 @@ class ServerTestFedProx(FedProx):
         self.server_test_time_by_round[int(server_round)] = dt_total
 
 
-    # Hook after aggregation each round
     def aggregate_train(self, server_round, results, *args, **kwargs):
 
-        # ---- normal aggregation
+        # ---- BUILD PARTITION MAP (giữ nguyên)
+        for reply in results:
+            node_id = reply.metadata.src_node_id
+            metric_record = reply.content["metrics"]
+            metrics = dict(metric_record)
+
+            if "partition-id" in metrics:
+                pid = int(metrics["partition-id"])
+                self.partition_to_node[pid] = node_id
+
+        print("UPDATED PARTITION → NODE MAP:")
+        print(self.partition_to_node)
+
+        # ---- NORMAL AGGREGATION
         agg = super().aggregate_train(server_round, results, *args, **kwargs)
 
-        # ==== [ROUND END MARK + COMPUTE WALL TIME]
-        start_t = self._round_start_time.get(int(server_round))
-
-        if start_t is not None:
-            round_time = float(time.perf_counter() - start_t)
-            self.round_wall_time[int(server_round)] = round_time
-
-        # ---- extract arrays + metrics safely
+        # ---- EXTRACT AGGREGATED TRAIN LOSS
         if isinstance(agg, tuple) and len(agg) == 2:
-            arrays_record, metrics = agg
+            arrays_record, aggregated_metrics = agg
         else:
             arrays_record = agg
-            metrics = None
+            aggregated_metrics = None
 
-        if metrics is not None:
-            try:
-                metrics_dict = dict(metrics)
-                train_loss = metrics_dict.get("train_loss")
-                if train_loss is not None:
-                    self.round_train_loss[int(server_round)] = float(train_loss)
-            except Exception:
-                pass
+        if aggregated_metrics is not None:
+            metrics_dict = dict(aggregated_metrics)
+            if "train_loss" in metrics_dict:
+                self.round_train_loss[int(server_round)] = float(
+                    metrics_dict["train_loss"]
+                )
 
+        # ---- RUN SERVER TEST
         if arrays_record is not None:
-            self._server_test(server_round=int(server_round), arrays_record=arrays_record)
+            self._server_test(server_round, arrays_record)
 
         return agg
+    # Hook after aggregation each round
+    # def aggregate_train(self, server_round, results, *args, **kwargs):
+
+    #     # ---- normal aggregation
+    #     agg = super().aggregate_train(server_round, results, *args, **kwargs)
+
+    #     # ==== [ROUND END MARK + COMPUTE WALL TIME]
+    #     start_t = self._round_start_time.get(int(server_round))
+
+    #     if start_t is not None:
+    #         round_time = float(time.perf_counter() - start_t)
+    #         self.round_wall_time[int(server_round)] = round_time
+
+    #     # ---- extract arrays + metrics safely
+    #     if isinstance(agg, tuple) and len(agg) == 2:
+    #         arrays_record, metrics = agg
+    #     else:
+    #         arrays_record = agg
+    #         metrics = None
+
+    #     if metrics is not None:
+    #         try:
+    #             metrics_dict = dict(metrics)
+    #             train_loss = metrics_dict.get("train_loss")
+    #             if train_loss is not None:
+    #                 self.round_train_loss[int(server_round)] = float(train_loss)
+    #         except Exception:
+    #             pass
+
+    #     if arrays_record is not None:
+    #         self._server_test(server_round=int(server_round), arrays_record=arrays_record)
+
+    #     return agg
 
 def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
@@ -227,7 +308,7 @@ def generate_sampling_plan(
     fraction_train: float,
     num_rounds: int,
     out_path: Path,
-    seed: int = 42,
+    seed: int = 84,
 ):
     random.seed(seed)
     clients = list(range(num_clients))
@@ -287,12 +368,12 @@ def main(grid: Grid, context: Context) -> None:
     # Start FL
     strategy = ServerTestFedProx(
         sampling_plan=sampling_plan,
-        fraction_train=fraction_train,
-        fraction_evaluate=fraction_train,
-        min_train_nodes=3,
-        min_evaluate_nodes=3,
-        min_available_nodes=3,
-        proximal_mu=0.0,
+        fraction_train=1.0,
+        fraction_evaluate=1.0,
+        min_train_nodes=num_clients,
+        min_evaluate_nodes=1,
+        min_available_nodes=num_clients,
+        proximal_mu=0.005,
         model_name=model_name,
         num_features=num_features,
         num_classes=num_classes,
@@ -306,7 +387,7 @@ def main(grid: Grid, context: Context) -> None:
         initial_arrays=initial_arrays,
         train_config=ConfigRecord({
             "lr": lr,
-            "proximal_mu": 0.0,
+            "proximal_mu": 0.005,
         }),
         num_rounds=num_rounds,
     )
