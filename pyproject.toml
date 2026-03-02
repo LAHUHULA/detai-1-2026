@@ -34,17 +34,17 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-exp-id = "exp_tab-res-net_non-iid-0.1_N10_fed_prox-0.005_ce-ft3_26_2_2026_v6"          # đổi tên tuỳ run
-num-server-rounds = 30
+exp-id = "exp_tab-res-net_iid_N10_fed_avg_ce-ft10_2_3_2026_v1"          # đổi tên tuỳ run
+num-server-rounds = 31
 num-clients = 10
-fraction-train = 0.3
-local-epochs = 3
-lr = 3e-3
+fraction-train = 1
+local-epochs = 5
+lr = 1e-3
 batch-size = 256
 
 # ===== model / partition =====
 model-name = "tab-res-net"                # "mlp" | "logistic" | "tab-res-net" | ""
-partition-mode = "dirichlet"            # "iid" | "dirichlet"
+partition-mode = "iid"            # "iid" | "dirichlet"
 dirichlet-alpha = 0.1         # chỉ dùng nếu partition-mode="dirichlet"
 
 # ===== Loss function ====
@@ -54,7 +54,7 @@ focal-gamma = 2.0         # only used when loss-type="focal"
 
 
 # ===== dataset (already MinMax scaled -> DO NOT rescale in code) =====
-num-features = 25
+num-features = 39
 num-classes = 13
 
 # Data root OUTSIDE app bundle (important for remote federation)

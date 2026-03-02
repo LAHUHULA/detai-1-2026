@@ -28,10 +28,11 @@ class ServerTestFedProx(FedProx):
         batch_size: int,
         test_csv_path: str,
         output_dir: Optional[str] = None,
+        initial_arrays = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-
+        self.initial_arrays = initial_arrays
         self.sampling_plan = sampling_plan
         self.model_name = model_name
         self.num_features = int(num_features)
@@ -106,34 +107,6 @@ class ServerTestFedProx(FedProx):
 
         return filtered
 
-    # def configure_fit(self, server_round, parameters, client_manager):
-    #     # ==== [FIX] mark round start time
-    #     self._round_start_time[int(server_round)] = time.perf_counter()
-
-    #     selected_ids = self.sampling_plan.get(str(server_round), [])
-
-    #     all_clients = list(client_manager.all().values())
-
-    #     selected_clients = [
-    #         c for c in all_clients
-    #         if int(c.cid) in selected_ids
-    #     ]
-
-    #     fit_ins = super().configure_fit(server_round, parameters, client_manager)
-
-    #     if not selected_clients:
-    #         return []
-
-    #     print(f"\nROUND {server_round}")
-    #     print("PLAN:", selected_ids)
-    #     print("ALL:", [c.cid for c in all_clients])
-    #     print("SELECTED:", [c.cid for c in selected_clients])
-
-    #     # rebuild FitIns with fixed client list
-    #     base_fitins = fit_ins[0][1] if fit_ins else None
-
-    #     return [(c, base_fitins) for c in selected_clients]
-
     def _append_csv(self, row: Dict[str, Any]) -> None:
         # write header once
         if not self._header_written:
@@ -191,26 +164,32 @@ class ServerTestFedProx(FedProx):
             "checkpoint_path": str(ckpt_path),
         }
 
-        # ==== [ADD] dt_no_csv: time up to (and including) inference + ckpt save, excluding CSV write
+        # ==== [ADD] dt_no_csv: inference + ckpt save (no csv yet)
         _t1 = time.perf_counter()
         dt_no_csv = float(_t1 - _t0)
-        row["server_test_time_s"] = dt_no_csv  # stays in the per-round CSV
 
-        # ==== [ADD] measure CSV write time separately, but include it in total test overhead accumulator
-        _t2 = time.perf_counter()
-        # ==== [ADD] attach round train loss + fl core time if available
+        # ==== attach optional round info
         if int(server_round) in self.round_train_loss:
             row["round_train_loss"] = self.round_train_loss[int(server_round)]
 
         if int(server_round) in self.round_wall_time:
             row["round_wall_time_s"] = self.round_wall_time[int(server_round)]
-    
+
+        # ==== measure CSV write time
+        _t2 = time.perf_counter()
+        row["server_test_time_s"] = dt_no_csv
         self._append_csv(row)
         _t3 = time.perf_counter()
+
         dt_csv = float(_t3 - _t2)
 
-        # ==== [ADD] accumulate total server-test overhead (includes csv write)
+        # ==== total server-test time (inference + csv)
         dt_total = dt_no_csv + dt_csv
+
+        # now safe to log it
+        row["server_test_time_s"] = dt_total
+
+        # accumulate
         self.server_test_time_total_s += dt_total
         self.server_test_time_by_round[int(server_round)] = dt_total
 
@@ -247,7 +226,24 @@ class ServerTestFedProx(FedProx):
                     metrics_dict["train_loss"]
                 )
 
-        # ---- RUN SERVER TEST
+        # Round 1 only used to build mapping
+        if int(server_round) == 1:
+            print("⚠ Round 1 used only for mapping. Resetting global model.")
+
+            # Reset global model to initial state
+            arrays_record = self.initial_arrays
+
+            # Remove round 1 metrics
+            if hasattr(self, "round_train_loss"):
+                self.round_train_loss.pop(1, None)
+
+            if hasattr(self, "round_wall_time"):
+                self.round_wall_time.pop(1, None)
+
+            # DO NOT run server-side test
+            return arrays_record, {}
+
+        # Normal behavior from round >= 2
         if arrays_record is not None:
             self._server_test(server_round, arrays_record)
 
@@ -373,13 +369,14 @@ def main(grid: Grid, context: Context) -> None:
         min_train_nodes=num_clients,
         min_evaluate_nodes=1,
         min_available_nodes=num_clients,
-        proximal_mu=0.005,
+        proximal_mu=0.00,
         model_name=model_name,
         num_features=num_features,
         num_classes=num_classes,
         batch_size=batch_size,
         test_csv_path=server_test_csv,
         output_dir=str(out_dir),
+        initial_arrays=initial_arrays,
     )
     t0 = time.perf_counter()
     result = strategy.start(
@@ -387,7 +384,7 @@ def main(grid: Grid, context: Context) -> None:
         initial_arrays=initial_arrays,
         train_config=ConfigRecord({
             "lr": lr,
-            "proximal_mu": 0.005,
+            "proximal_mu": 0.00,
         }),
         num_rounds=num_rounds,
     )
@@ -400,11 +397,12 @@ def main(grid: Grid, context: Context) -> None:
 
     # Estimate comm/time
     total_time = float(t1 - t0)
-    avg_round_time = total_time / max(num_rounds, 1)
+    effective_rounds = max(num_rounds - 1, 1)
+    avg_round_time = total_time / effective_rounds
     # ==== [ADD] estimate "FL core time" by subtracting server_test time
     server_test_time_total_s = float(getattr(strategy, "server_test_time_total_s", 0.0))
-    fl_core_time_s = max(0.0, float(total_time - server_test_time_total_s))
-    avg_round_fl_core_time_s = fl_core_time_s / max(num_rounds, 1)
+    # fl_core_time_s = max(0.0, float(total_time - server_test_time_total_s))
+    # avg_round_fl_core_time_s = fl_core_time_s / max(num_rounds, 1)
     avg_round_server_test_time_s = server_test_time_total_s / max(num_rounds, 1)
     model_bytes = sum(v.numel() * v.element_size() for v in state_dict.values() if torch.is_tensor(v))
     clients_per_round = max(1, int(round(fraction_train * num_clients)))
@@ -450,8 +448,8 @@ def main(grid: Grid, context: Context) -> None:
         "avg_round_time_s": float(avg_round_time),
         # ==== [ADD] time breakdown
         "server_test_time_total_s": float(server_test_time_total_s),
-        "fl_core_time_s": float(fl_core_time_s),
-        "avg_round_fl_core_time_s": float(avg_round_fl_core_time_s),
+        # "fl_core_time_s": float(fl_core_time_s),
+        # "avg_round_fl_core_time_s": float(avg_round_fl_core_time_s),
         "avg_round_server_test_time_s": float(avg_round_server_test_time_s),
         "model_size_kib": float(model_bytes / 1024.0),
         "est_comm_per_round_mib": est_comm_per_round_mib,
@@ -465,12 +463,13 @@ def main(grid: Grid, context: Context) -> None:
 
     # Append global summary CSV
     summary_path = out_root / "results_summary.csv"
+    # "fl_core_time_s", "avg_round_fl_core_time_s"
     header = [
         "exp_id", "model", "partition_mode", "dirichlet_alpha",
         "num_clients", "num_rounds", "fraction_train", "local_epochs",
         "batch_size", "lr", "num_features", "num_classes",
-        "total_time_s", "avg_round_time_s", "server_test_time_total_s", "fl_core_time_s",
-        "avg_round_fl_core_time_s", "avg_round_server_test_time_s", 
+        "total_time_s", "avg_round_time_s", "server_test_time_total_s",
+        "avg_round_server_test_time_s", 
         "model_size_kib", "est_comm_per_round_mib",
         "global_test_loss", "global_test_acc",
         "precision_macro", "recall_macro", "f1_macro",
