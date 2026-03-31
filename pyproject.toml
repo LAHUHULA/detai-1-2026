@@ -34,17 +34,17 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-exp-id = "exp_tab-res-net_iid_N10_fed_avg_ce-ft10_2_3_2026_v1"          # đổi tên tuỳ run
-num-server-rounds = 31
+exp-id = "exp_logistic_non-iid-0.1_N10_fed_prox-0.01_ce-ft10"          # đổi tên tuỳ run
+num-server-rounds = 51
 num-clients = 10
 fraction-train = 1
-local-epochs = 5
+local-epochs = 3
 lr = 1e-3
 batch-size = 256
 
 # ===== model / partition =====
-model-name = "tab-res-net"                # "mlp" | "logistic" | "tab-res-net" | ""
-partition-mode = "iid"            # "iid" | "dirichlet"
+model-name = "logistic"                # "mlp" | "logistic" | "tab-res-net" | ""
+partition-mode = "dirichlet"            # "iid" | "dirichlet"
 dirichlet-alpha = 0.1         # chỉ dùng nếu partition-mode="dirichlet"
 
 # ===== Loss function ====

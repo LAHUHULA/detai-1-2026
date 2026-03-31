@@ -369,7 +369,7 @@ def main(grid: Grid, context: Context) -> None:
         min_train_nodes=num_clients,
         min_evaluate_nodes=1,
         min_available_nodes=num_clients,
-        proximal_mu=0.00,
+        proximal_mu=0.01,
         model_name=model_name,
         num_features=num_features,
         num_classes=num_classes,
@@ -384,7 +384,7 @@ def main(grid: Grid, context: Context) -> None:
         initial_arrays=initial_arrays,
         train_config=ConfigRecord({
             "lr": lr,
-            "proximal_mu": 0.00,
+            "proximal_mu": 0.01,
         }),
         num_rounds=num_rounds,
     )
