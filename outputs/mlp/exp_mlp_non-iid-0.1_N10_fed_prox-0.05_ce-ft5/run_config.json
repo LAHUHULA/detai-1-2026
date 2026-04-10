@@ -1,0 +1,22 @@
+{
+  "exp-id": "exp_mlp_non-iid-0.1_N10_fed_prox-0.05_ce-ft5",
+  "num-server-rounds": 51,
+  "num-clients": 10,
+  "fraction-train": 0.5,
+  "local-epochs": 3,
+  "lr": 0.001,
+  "batch-size": 256,
+  "model-name": "mlp",
+  "partition-mode": "dirichlet",
+  "dirichlet-alpha": 0.1,
+  "loss-type": "ce",
+  "loss-label-smoothing": 0.0,
+  "focal-gamma": 2.0,
+  "num-features": 39,
+  "num-classes": 13,
+  "data-root": "~/projects/ddos-attack/data",
+  "do-centralized-test": true,
+  "server-test-csv": "C:/Users/dangn/OneDrive/Desktop/flower/ddos-attack/data/test_final.csv",
+  "infer-bench-csv": "~/projects/ddos-attack/data/infer_bench.csv",
+  "output-dir": "outputs"
+}
