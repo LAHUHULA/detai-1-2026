@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from typing import Dict, Any
 
 
 # ============================================================
@@ -26,6 +27,24 @@ from torch.utils.data import DataLoader, Dataset
 
 _label_to_int: dict[str, int] | None = None
 _int_to_label: list[str] | None = None
+
+# ============================================================
+# [ADD] Lazy import for XGBoost
+# ============================================================
+
+def _require_xgboost():
+    try:
+        import xgboost as xgb  # type: ignore
+        return xgb
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "XGBoost is required but not installed in the Flower runtime environment.\n"
+            "Fix:\n"
+            "  1) Add xgboost to [project].dependencies in pyproject.toml\n"
+            "  2) Bump project.version\n"
+            "  3) Re-run `flwr run ...` so Flower rebuilds the app bundle\n"
+            "  4) Or install manually on each Pi: pip install xgboost\n"
+        ) from e
 
 
 def _load_label_map_required() -> None:
@@ -365,6 +384,179 @@ def load_data(
     
     return train_loader, val_loader, class_weights
 
+# ============================================================
+# [ADD] XGBoost utilities
+# ============================================================
+
+def load_data_numpy(
+    partition_id: int,
+    num_partitions: int,
+    mode: str = "iid",
+    dirichlet_alpha: float = 0.5,
+    data_root: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return local train/val split as numpy arrays for XGBoost."""
+    local_csv = _local_client_csv_path(
+        int(partition_id), int(num_partitions), mode, float(dirichlet_alpha), data_root
+    )
+    if not local_csv.exists():
+        raise FileNotFoundError(f"Client CSV not found: {local_csv}")
+
+    Xc, yc = _load_csv(str(local_csv))
+
+    n = len(Xc)
+    rng = np.random.RandomState(100 + int(partition_id))
+    idx = rng.permutation(n)
+    split = max(1, int(0.8 * n))
+
+    X_train, y_train = Xc[idx[:split]], yc[idx[:split]]
+    X_val, y_val = Xc[idx[split:]], yc[idx[split:]]
+
+    if len(X_val) == 0:
+        X_val, y_val = X_train, y_train
+
+    return X_train, y_train, X_val, y_val
+
+
+def load_centralized_test_numpy(test_csv_path: str) -> tuple[np.ndarray, np.ndarray]:
+    p = Path(test_csv_path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"server-test-csv not found: {p}")
+    return _load_csv(str(p))
+
+
+def build_xgb_params_from_cfg(cfg: dict, num_classes: int) -> Dict[str, Any]:
+    objective = str(cfg.get("xgb-objective", "multi:softprob"))
+    params: Dict[str, Any] = {
+        "eta": float(cfg.get("xgb-eta", 0.15)),
+        "max_depth": int(cfg.get("xgb-max-depth", 4)),
+        "subsample": float(cfg.get("xgb-subsample", 0.8)),
+        "colsample_bytree": float(cfg.get("xgb-colsample-bytree", 0.8)),
+        "max_bin": int(cfg.get("xgb-max-bin", 63)),
+        "nthread": int(cfg.get("xgb-nthread", 2)),
+        "tree_method": str(cfg.get("xgb-tree-method", "hist")),
+        "objective": objective,
+        "eval_metric": str(cfg.get("xgb-eval-metric", "mlogloss")),
+        "verbosity": 0,
+    }
+    if objective.startswith("multi:"):
+        params["num_class"] = int(num_classes)
+    return params
+
+
+def xgb_train_one_client(
+    global_model_bytes: bytes | bytearray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    cfg: dict,
+    num_classes: int,
+    num_local_round: int,
+) -> bytes:
+    """Train local XGBoost and return ONLY the local trees to send to server."""
+    xgb = _require_xgboost()
+    params = build_xgb_params_from_cfg(cfg, num_classes)
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+
+    if global_model_bytes is None or len(global_model_bytes) == 0:
+        bst = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=int(num_local_round),
+        )
+    else:
+        bst = xgb.Booster(params=params)
+        bst.load_model(bytearray(global_model_bytes))
+
+        for _ in range(int(num_local_round)):
+            bst.update(dtrain, bst.num_boosted_rounds())
+
+        start = max(0, bst.num_boosted_rounds() - int(num_local_round))
+        bst = bst[start:bst.num_boosted_rounds()]
+
+    local_model = bst.save_raw("json")
+    return local_model
+
+
+def xgb_predict_classes(
+    model_bytes: bytes | bytearray,
+    X: np.ndarray,
+    cfg: dict,
+    num_classes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Safe prediction for XGBoost Booster bytes.
+    If model is empty / invalid, return fallback predictions instead of crashing.
+    """
+    xgb = _require_xgboost()
+
+    # [ADD] empty model guard
+    if model_bytes is None or len(model_bytes) == 0:
+        pred = np.zeros(len(X), dtype=np.int64)
+        probs = np.zeros((len(X), num_classes), dtype=np.float32)
+        probs[:, 0] = 1.0
+        return pred, probs
+
+    params = build_xgb_params_from_cfg(cfg, num_classes)
+
+    try:
+        bst = xgb.Booster(params=params)
+        bst.load_model(bytearray(model_bytes))
+
+        # [ADD] extra safety: some boosters can load but still be unusable
+        dmat = xgb.DMatrix(X)
+        probs = bst.predict(dmat)
+
+        if probs.ndim == 1:
+            pred = (probs >= 0.5).astype(np.int64)
+            probs_2d = np.stack([1.0 - probs, probs], axis=1)
+            return pred, probs_2d
+
+        pred = np.argmax(probs, axis=1).astype(np.int64)
+        return pred, probs
+
+    except Exception as e:
+        # [ADD] fallback instead of crashing client
+        print(f"[WARN] xgb_predict_classes fallback due to invalid booster: {e}")
+        pred = np.zeros(len(X), dtype=np.int64)
+        probs = np.zeros((len(X), num_classes), dtype=np.float32)
+        probs[:, 0] = 1.0
+        return pred, probs
+
+
+def xgb_evaluate_bytes(
+    model_bytes: bytes | bytearray,
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: dict,
+    num_classes: int,
+) -> tuple[float, float, float, float, float, float, float, float]:
+    """
+    Safe evaluation for XGBoost model bytes.
+    Never crash on empty/invalid model.
+    """
+    pred, probs = xgb_predict_classes(model_bytes, X, cfg, num_classes)
+
+    eps = 1e-12
+
+    try:
+        if probs.ndim == 2:
+            row_idx = np.arange(len(y))
+            clipped = np.clip(probs[row_idx, y], eps, 1.0)
+            loss = float(-np.mean(np.log(clipped)))
+        else:
+            p = np.clip(probs, eps, 1.0 - eps)
+            loss = float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+    except Exception:
+        # [ADD] fallback loss
+        loss = 999.0
+
+    y_true_t = torch.from_numpy(y.astype(np.int64))
+    y_pred_t = torch.from_numpy(pred.astype(np.int64))
+
+    acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = multiclass_metrics(
+        y_true_t, y_pred_t, num_classes
+    )
+    return loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w
 
 # ============================================================
 # 5) Training/Eval + metrics
