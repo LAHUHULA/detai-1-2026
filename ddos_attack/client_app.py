@@ -6,9 +6,10 @@ from flwr.clientapp import ClientApp
 from ddos_attack.task import (
     build_model,
     load_data,
-    load_data_numpy,              # [ADD]
-    xgb_train_one_client,         # [ADD]
-    xgb_evaluate_bytes,           # [ADD]
+    load_data_numpy,
+    xgb_train_one_client,
+    xgb_train_one_client_cyclic,   # [ADD]
+    xgb_evaluate_bytes,
     train as train_fn,
     test as test_fn,
     get_num_features_classes_from_local_csv,
@@ -60,6 +61,8 @@ def train(msg: Message, context: Context):
     # [ADD] XGBoost branch
     # ============================================================
     if model_name == "xgboost":
+        strategy_name = str(_k(cfg, "strategy-name", "fedxgbbagging")).lower().strip()
+
         X_train, y_train, _, _ = load_data_numpy(
             partition_id=partition_id,
             num_partitions=num_partitions,
@@ -72,14 +75,32 @@ def train(msg: Message, context: Context):
         if "arrays" in msg.content and "0" in msg.content["arrays"]:
             global_model_bytes = bytearray(msg.content["arrays"]["0"].numpy().tobytes())
 
-        local_model_bytes = xgb_train_one_client(
-            global_model_bytes=global_model_bytes,
-            X_train=X_train,
-            y_train=y_train,
-            cfg=cfg,
-            num_classes=num_classes,
-            num_local_round=local_epochs,
-        )
+        # ============================================================
+        # [ADD] choose XGBoost training mode by strategy-name
+        # ============================================================
+        if strategy_name == "fedxgbbagging":
+            local_model_bytes = xgb_train_one_client(
+                global_model_bytes=global_model_bytes,
+                X_train=X_train,
+                y_train=y_train,
+                cfg=cfg,
+                num_classes=num_classes,
+                num_local_round=local_epochs,
+            )
+        elif strategy_name == "fedxgbcyclic":
+            local_model_bytes = xgb_train_one_client_cyclic(
+                global_model_bytes=global_model_bytes,
+                X_train=X_train,
+                y_train=y_train,
+                cfg=cfg,
+                num_classes=num_classes,
+                num_local_round=local_epochs,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported strategy-name='{strategy_name}' for model-name='xgboost'. "
+                f"Use 'fedxgbbagging' or 'fedxgbcyclic'."
+            )
 
         t1 = time.perf_counter()
         monitor.stop()

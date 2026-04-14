@@ -10,7 +10,7 @@ import torch
 
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord  # [ADD MetricRecord]
 from flwr.serverapp import Grid, ServerApp
-from flwr.serverapp.strategy import FedAvg, FedAvgM, FedProx, FedXgbBagging  # [ADD]
+from flwr.serverapp.strategy import FedAvg, FedAvgM, FedProx, FedXgbBagging, FedXgbCyclic
 
 from ddos_attack.task import (
     build_model,
@@ -425,21 +425,32 @@ def main(grid: Grid, context: Context) -> None:
     _save_json(out_dir / "run_config.json", dict(cfg))
 
     # ============================================================
-    # [ADD] XGBoost + FedXgbBagging branch
+    # [ADD] XGBoost branch: FedXgbBagging or FedXgbCyclic
     # ============================================================
     if model_name == "xgboost":
-        if strategy_name != "fedxgbbagging":
-            raise ValueError("For model-name='xgboost', set strategy-name='fedxgbbagging'")
+        if strategy_name not in ("fedxgbbagging", "fedxgbcyclic"):
+            raise ValueError(
+                "For model-name='xgboost', set strategy-name to "
+                "'fedxgbbagging' or 'fedxgbcyclic'"
+            )
 
         initial_arrays = ArrayRecord([np.frombuffer(b"", dtype=np.uint8)])
 
-        strategy = FedXgbBagging(
-            fraction_train=fraction_train,
-            fraction_evaluate=fraction_evaluate,
-            min_train_nodes=num_clients,
-            min_evaluate_nodes=num_clients,
-            min_available_nodes=num_clients,
-        )
+        if strategy_name == "fedxgbbagging":
+            strategy = FedXgbBagging(
+                fraction_train=fraction_train,
+                fraction_evaluate=fraction_evaluate,
+                min_train_nodes=num_clients,
+                min_evaluate_nodes=num_clients,
+                min_available_nodes=num_clients,
+            )
+        else:
+            # [ADD] FedXgbCyclic
+            strategy = FedXgbCyclic(
+                fraction_train=fraction_train,
+                fraction_evaluate=fraction_evaluate,
+                min_available_nodes=num_clients,
+            )
 
         t0 = time.perf_counter()
         result = strategy.start(

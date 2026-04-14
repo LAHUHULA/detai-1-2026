@@ -2,6 +2,7 @@ data/
 None/
 outputs/
 images/
+clean-repo/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

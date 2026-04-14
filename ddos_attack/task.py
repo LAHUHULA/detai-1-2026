@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from typing import Dict, Any
+from typing import Tuple, Dict, Any
 
 
 # ============================================================
@@ -522,6 +522,46 @@ def xgb_predict_classes(
         probs[:, 0] = 1.0
         return pred, probs
 
+# ============================================================
+# [ADD] XGBoost train for FedXgbCyclic
+# ============================================================
+
+def xgb_train_one_client_cyclic(
+    global_model_bytes: bytes | bytearray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    cfg: dict,
+    num_classes: int,
+    num_local_round: int,
+) -> bytes:
+    """
+    Train local XGBoost for FedXgbCyclic and return the FULL updated model.
+    Difference from bagging:
+      - Bagging returns only newly added local trees
+      - Cyclic returns the full updated booster
+    """
+    xgb = _require_xgboost()
+    params = build_xgb_params_from_cfg(cfg, num_classes)
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+
+    # Round 1 / empty global model
+    if global_model_bytes is None or len(global_model_bytes) == 0:
+        bst = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=int(num_local_round),
+        )
+        return bst.save_raw("json")
+
+    # Continue training from received global booster
+    bst = xgb.Booster(params=params)
+    bst.load_model(bytearray(global_model_bytes))
+
+    for _ in range(int(num_local_round)):
+        bst.update(dtrain, bst.num_boosted_rounds())
+
+    # [IMPORTANT] return FULL updated model for cyclic
+    return bst.save_raw("json")
 
 def xgb_evaluate_bytes(
     model_bytes: bytes | bytearray,
