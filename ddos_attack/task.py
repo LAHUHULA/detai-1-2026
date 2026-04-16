@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import json
 from pathlib import Path
-from typing import Tuple
+import base64
 
 import numpy as np
 import pandas as pd
@@ -17,7 +17,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from typing import Tuple, Dict, Any
 
 
@@ -597,6 +597,191 @@ def xgb_evaluate_bytes(
         y_true_t, y_pred_t, num_classes
     )
     return loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w
+
+# ============================================================
+# [ADD] FedXGBllr-style practical meta learner
+# ============================================================
+
+class FedXGBllrMetaCNN(nn.Module):
+    """
+    Flower-compatible practical FedXGBllr meta learner.
+
+    Input:
+        x: [B, K, C]
+        - B: batch size
+        - K: number of client XGBoost ensembles
+        - C: number of classes
+
+    We learn a lightweight 1D-CNN over stacked client-ensemble predictions.
+    """
+    def __init__(self, num_models: int, num_classes: int, hidden_channels: int = 32):
+        super().__init__()
+        self.num_models = int(num_models)
+        self.num_classes = int(num_classes)
+        self.hidden_channels = int(hidden_channels)
+
+        self.conv = nn.Conv1d(
+            in_channels=self.num_classes,
+            out_channels=self.hidden_channels,
+            kernel_size=self.num_models,
+            stride=self.num_models,
+            bias=True,
+        )
+        self.act = nn.ReLU(inplace=True)
+        self.fc = nn.Linear(self.hidden_channels, self.num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, K, C] -> [B, C, K]
+        if x.dim() != 3:
+            raise ValueError(f"FedXGBllrMetaCNN expects [B, K, C], got shape={tuple(x.shape)}")
+        x = x.transpose(1, 2).contiguous()
+        x = self.conv(x)         # [B, hidden_channels, 1]
+        x = self.act(x)
+        x = x.squeeze(-1)        # [B, hidden_channels]
+        x = self.fc(x)           # [B, C]
+        return x
+
+
+def build_xgbllr_meta_model(num_models: int, num_classes: int) -> nn.Module:
+    return FedXGBllrMetaCNN(num_models=num_models, num_classes=num_classes, hidden_channels=32)
+
+
+def xgb_models_to_json(model_bytes_list: list[bytes | bytearray]) -> str:
+    payload = []
+    for b in model_bytes_list:
+        payload.append(base64.b64encode(bytes(b)).decode("utf-8"))
+    return json.dumps(payload)
+
+
+def xgb_models_from_json(payload: str) -> list[bytes]:
+    if payload is None or str(payload).strip() == "":
+        return []
+    arr = json.loads(payload)
+    return [base64.b64decode(x.encode("utf-8")) for x in arr]
+
+
+def build_xgbllr_features_from_models(
+    model_bytes_list: list[bytes | bytearray],
+    X: np.ndarray,
+    cfg: dict,
+    num_classes: int,
+) -> np.ndarray:
+    """
+    Build fixed meta-features from K frozen client XGBoost ensembles.
+
+    Output shape:
+        [N, K, C]
+    """
+    if len(model_bytes_list) == 0:
+        raise ValueError("No XGBoost ensemble bytes provided to build FedXGBllr features.")
+
+    feats = []
+    for model_bytes in model_bytes_list:
+        _, probs = xgb_predict_classes(model_bytes, X, cfg, num_classes)
+
+        # Ensure [N, C]
+        if probs.ndim == 1:
+            probs = np.stack([1.0 - probs, probs], axis=1)
+
+        if probs.shape[1] != num_classes:
+            fixed = np.zeros((len(X), num_classes), dtype=np.float32)
+            width = min(num_classes, probs.shape[1])
+            fixed[:, :width] = probs[:, :width]
+            probs = fixed
+
+        feats.append(probs.astype(np.float32))
+
+    return np.stack(feats, axis=1)  # [N, K, C]
+
+
+def train_xgbllr_meta(
+    model: nn.Module,
+    features_np: np.ndarray,
+    labels_np: np.ndarray,
+    epochs: int,
+    lr: float,
+    batch_size: int,
+    device: torch.device,
+    class_weights: torch.Tensor | None = None,
+) -> float:
+    model.to(device)
+
+    x = torch.from_numpy(features_np.astype("float32"))
+    y = torch.from_numpy(labels_np.astype("int64"))
+    ds = TensorDataset(x, y)
+    dl = DataLoader(ds, batch_size=int(batch_size), shuffle=True, drop_last=False)
+
+    cw = class_weights.to(device) if class_weights is not None else None
+    criterion = nn.CrossEntropyLoss(weight=cw)
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(lr))
+
+    model.train()
+    total_loss = 0.0
+    batch_count = 0
+
+    for _ in range(int(epochs)):
+        for xb, yb in dl:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += float(loss.item())
+            batch_count += 1
+
+    return total_loss / max(batch_count, 1)
+
+
+def test_xgbllr_meta(
+    model: nn.Module,
+    features_np: np.ndarray,
+    labels_np: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+    num_classes: int,
+) -> tuple[float, float, float, float, float, float, float, float]:
+    model.to(device)
+
+    x = torch.from_numpy(features_np.astype("float32"))
+    y = torch.from_numpy(labels_np.astype("int64"))
+    ds = TensorDataset(x, y)
+    dl = DataLoader(ds, batch_size=int(batch_size), shuffle=False, drop_last=False)
+
+    criterion = nn.CrossEntropyLoss()
+
+    model.eval()
+    total_loss = 0.0
+    batch_count = 0
+    all_true = []
+    all_pred = []
+
+    with torch.no_grad():
+        for xb, yb in dl:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            logits = model(xb)
+            loss = criterion(logits, yb)
+
+            total_loss += float(loss.item())
+            batch_count += 1
+
+            pred = torch.argmax(logits, dim=1)
+            all_true.append(yb.detach().cpu())
+            all_pred.append(pred.detach().cpu())
+
+    avg_loss = total_loss / max(batch_count, 1)
+    y_true = torch.cat(all_true, dim=0)
+    y_pred = torch.cat(all_pred, dim=0)
+
+    (acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w) = multiclass_metrics(
+        y_true, y_pred, num_classes
+    )
+    return avg_loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w
 
 # ============================================================
 # 5) Training/Eval + metrics

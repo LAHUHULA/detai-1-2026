@@ -15,9 +15,14 @@ from flwr.serverapp.strategy import FedAvg, FedAvgM, FedProx, FedXgbBagging, Fed
 from ddos_attack.task import (
     build_model,
     load_centralized_testloader,
-    load_centralized_test_numpy,          # [ADD]
-    build_xgb_params_from_cfg,            # [ADD]
-    xgb_evaluate_bytes,                   # [ADD]
+    load_centralized_test_numpy,
+    build_xgb_params_from_cfg,
+    xgb_evaluate_bytes,
+    build_xgbllr_meta_model,          # [ADD]
+    xgb_models_to_json,               # [ADD]
+    xgb_models_from_json,             # [ADD]
+    build_xgbllr_features_from_models, # [ADD]
+    test_xgbllr_meta,                 # [ADD]
     test as test_fn,
 )
 # ============================================================
@@ -82,6 +87,69 @@ def _server_side_xgb_eval(server_round: int, arrays: ArrayRecord, cfg: dict, num
         })
     except Exception as e:
         print(f"[WARN] Round {server_round}: server-side XGBoost eval skipped due to error: {e}")
+        return None
+    
+# ============================================================
+# [ADD] FedXGBllr server-side evaluation helper
+# ============================================================
+
+def _server_side_xgbllr_eval(
+    server_round: int,
+    arrays: ArrayRecord,
+    cfg: dict,
+    num_classes: int,
+    xgb_models_json: str,
+):
+    if xgb_models_json is None or str(xgb_models_json).strip() == "":
+        print(f"[WARN] Round {server_round}: no FedXGBllr frozen XGBoost ensembles, skip server eval.")
+        return None
+
+    test_csv = str(cfg.get("server-test-csv", "")).strip()
+    if not test_csv:
+        print(f"[WARN] Round {server_round}: no server-test-csv configured, skip server eval.")
+        return None
+
+    try:
+        xgb_model_list = xgb_models_from_json(xgb_models_json)
+        if len(xgb_model_list) == 0:
+            print(f"[WARN] Round {server_round}: empty FedXGBllr ensemble list, skip server eval.")
+            return None
+
+        X_test, y_test = load_centralized_test_numpy(test_csv)
+        meta_features = build_xgbllr_features_from_models(
+            xgb_model_list, X_test, cfg, num_classes
+        )
+
+        meta_model = build_xgbllr_meta_model(
+            num_models=len(xgb_model_list),
+            num_classes=num_classes,
+        )
+        meta_model.load_state_dict(arrays.to_torch_state_dict())
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        meta_model.to(device)
+
+        loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = test_xgbllr_meta(
+            model=meta_model,
+            features_np=meta_features,
+            labels_np=y_test,
+            batch_size=int(cfg.get("batch-size", 256)),
+            device=device,
+            num_classes=num_classes,
+        )
+
+        return MetricRecord({
+            "global_test_loss": float(loss),
+            "global_test_acc": float(acc),
+            "precision_macro": float(p_macro),
+            "recall_macro": float(r_macro),
+            "f1_macro": float(f1_macro),
+            "precision_weighted": float(p_w),
+            "recall_weighted": float(r_w),
+            "f1_weighted": float(f1_w),
+        })
+    except Exception as e:
+        print(f"[WARN] Round {server_round}: FedXGBllr server eval skipped due to error: {e}")
         return None
 
 # ---- ADD: FedAvg subclass to run centralized test each round ----
@@ -357,6 +425,191 @@ class ServerTestFedProx(FedProx):
 
         return agg
 
+# ============================================================
+# [ADD] FedXGBllr strategy
+# Round 1: bootstrap local XGB ensembles + mapping
+# Round >=2: train meta-learner with FedAvg on frozen ensemble outputs
+# ============================================================
+
+class ServerFedXGBllr(FedAvg):
+    def __init__(
+        self,
+        *args,
+        sampling_plan: dict,
+        num_clients: int,
+        local_xgb_rounds: int,
+        meta_initial_arrays: ArrayRecord,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.sampling_plan = sampling_plan
+        self.num_clients = int(num_clients)
+        self.local_xgb_rounds = int(local_xgb_rounds)
+        self.meta_initial_arrays = meta_initial_arrays
+        self.bootstrap_arrays = ArrayRecord([np.frombuffer(b"", dtype=np.uint8)])
+
+        self.partition_to_node: dict[int, int] = {}
+        self.local_xgb_models: dict[int, bytes] = {}
+        self.xgb_models_json: str = ""
+
+        self.round_train_loss: dict[int, float] = {}
+        self.round_wall_time: dict[int, float] = {}
+        self._round_start_time: dict[int, float] = {}
+
+    def configure_train(self, server_round, arrays, config, grid):
+        self._round_start_time[int(server_round)] = time.perf_counter()
+
+        selected_partitions = set(
+            int(x) for x in self.sampling_plan.get(str(server_round), [])
+        )
+
+        print(f"\n========== ROUND {server_round} (FedXGBllr) ==========")
+        print("PLAN:", selected_partitions)
+        print("CURRENT MAP:", self.partition_to_node)
+
+        # -------------------- ROUND 1: bootstrap local XGB --------------------
+        if int(server_round) == 1:
+            bootstrap_cfg = ConfigRecord({
+                "phase": "bootstrap_xgbllr",
+                "local_xgb_rounds": int(self.local_xgb_rounds),
+            })
+            messages = super().configure_train(server_round, self.bootstrap_arrays, bootstrap_cfg, grid)
+            print("⚠ Round 1 for mapping + frozen local XGB ensemble collection.")
+            return messages
+
+        # -------------------- ROUND >=2: train meta learner --------------------
+        meta_cfg = ConfigRecord({
+            "phase": "train_meta_xgbllr",
+            "xgb_models_json": self.xgb_models_json,
+            "lr": float(config.get("lr", 1e-3)) if config is not None else 1e-3,
+        })
+        messages = super().configure_train(server_round, arrays, meta_cfg, grid)
+
+        # preserve your mapping logic from round 2 onward
+        if len(self.partition_to_node) == 0:
+            print("⚠ Mapping not ready yet. Let all nodes train.")
+            return messages
+
+        selected_node_ids = {
+            self.partition_to_node[p]
+            for p in selected_partitions
+            if p in self.partition_to_node
+        }
+
+        print("SELECTED NODE IDS:", selected_node_ids)
+        print("================================")
+
+        filtered = [
+            msg for msg in messages
+            if msg.metadata.dst_node_id in selected_node_ids
+        ]
+        return filtered
+
+    def aggregate_train(self, server_round, results, *args, **kwargs):
+        valid_results = []
+
+        for reply in results:
+            node_id = reply.metadata.src_node_id
+
+            if not reply.has_content():
+                if reply.has_error():
+                    try:
+                        print(f"[WARN] Round {server_round}: node {node_id} returned error: {reply.error}")
+                    except Exception:
+                        print(f"[WARN] Round {server_round}: node {node_id} returned an error reply.")
+                else:
+                    print(f"[WARN] Round {server_round}: node {node_id} returned empty reply.")
+                continue
+
+            valid_results.append(reply)
+
+            try:
+                metric_record = reply.content["metrics"]
+                metrics = dict(metric_record)
+                if "partition-id" in metrics:
+                    pid = int(metrics["partition-id"])
+                    self.partition_to_node[pid] = node_id
+            except Exception as e:
+                print(f"[WARN] Round {server_round}: failed to read partition-id from node {node_id}: {e}")
+
+        print("UPDATED PARTITION → NODE MAP:")
+        print(self.partition_to_node)
+
+        if len(valid_results) == 0:
+            raise RuntimeError(
+                f"No valid client replies with content in round {server_round}. "
+                "Check client logs for the original exception."
+            )
+
+        # -------------------- ROUND 1: store frozen local XGB ensembles --------------------
+        if int(server_round) == 1:
+            self.local_xgb_models = {}
+
+            for reply in valid_results:
+                metrics = dict(reply.content["metrics"])
+                pid = int(metrics["partition-id"])
+                model_bytes = bytearray(reply.content["arrays"]["0"].numpy().tobytes())
+                self.local_xgb_models[pid] = bytes(model_bytes)
+
+            expected = list(range(self.num_clients))
+            missing = [pid for pid in expected if pid not in self.local_xgb_models]
+            if missing:
+                raise RuntimeError(f"FedXGBllr round 1 missing frozen XGB models for partitions: {missing}")
+
+            ordered_models = [self.local_xgb_models[pid] for pid in expected]
+            self.xgb_models_json = xgb_models_to_json(ordered_models)
+
+            print("⚠ Round 1 completed. Frozen XGB ensembles collected and sorted.")
+            print("⚠ Resetting global model to initial meta-learner.")
+
+            # round 1 does NOT evaluate; return initialized meta arrays
+            return self.meta_initial_arrays, {}
+
+        # -------------------- ROUND >=2: aggregate meta learner with FedAvg --------------------
+        agg = super().aggregate_train(server_round, valid_results, *args, **kwargs)
+
+        if isinstance(agg, tuple) and len(agg) == 2:
+            arrays_record, aggregated_metrics = agg
+        else:
+            arrays_record = agg
+            aggregated_metrics = None
+
+        if int(server_round) in self._round_start_time:
+            self.round_wall_time[int(server_round)] = float(
+                time.perf_counter() - self._round_start_time[int(server_round)]
+            )
+
+        if aggregated_metrics is not None:
+            metrics_dict = dict(aggregated_metrics)
+            if "train_loss" in metrics_dict:
+                self.round_train_loss[int(server_round)] = float(metrics_dict["train_loss"])
+
+        return agg
+
+    def configure_evaluate(self, server_round, arrays, config, grid):
+        # skip evaluation in round 1 because only mapping/bootstrap happens there
+        if int(server_round) == 1:
+            return []
+
+        eval_cfg = ConfigRecord({
+            "phase": "eval_meta_xgbllr",
+            "xgb_models_json": self.xgb_models_json,
+        })
+        return super().configure_evaluate(server_round, arrays, eval_cfg, grid)
+
+    def aggregate_evaluate(self, server_round, results, *args, **kwargs):
+        valid_results = []
+        for reply in results:
+            if not reply.has_content():
+                continue
+            valid_results.append(reply)
+
+        if len(valid_results) == 0:
+            print(f"[WARN] Round {server_round}: no valid evaluate replies.")
+            return None
+
+        return super().aggregate_evaluate(server_round, valid_results, *args, **kwargs)
+
 def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -368,11 +621,69 @@ def _save_json(path: Path, obj: dict) -> None:
 
 def _append_csv_row(path: Path, header: list[str], row: dict) -> None:
     file_exists = path.exists()
+    clean_row = {k: row.get(k, None) for k in header}
     with path.open("a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=header)
         if not file_exists:
             w.writeheader()
-        w.writerow(row)
+        w.writerow(clean_row)
+
+# ============================================================
+# [ADD] Per-round global test CSV writer for XGBoost branches
+# ============================================================
+
+def _append_global_test_per_round_csv(
+    csv_path: Path,
+    server_round: int,
+    metric_record,
+    extra: dict | None = None,
+) -> None:
+    """
+    Append per-round global test metrics to CSV.
+
+    metric_record: MetricRecord or dict-like object containing:
+        global_test_loss, global_test_acc,
+        precision_macro, recall_macro, f1_macro,
+        precision_weighted, recall_weighted, f1_weighted
+    """
+    if metric_record is None:
+        return
+
+    metrics = dict(metric_record)
+    row = {
+        "round": int(server_round),
+        "global_test_loss": metrics.get("global_test_loss"),
+        "global_test_acc": metrics.get("global_test_acc"),
+        "precision_macro": metrics.get("precision_macro"),
+        "recall_macro": metrics.get("recall_macro"),
+        "f1_macro": metrics.get("f1_macro"),
+        "precision_weighted": metrics.get("precision_weighted"),
+        "recall_weighted": metrics.get("recall_weighted"),
+        "f1_weighted": metrics.get("f1_weighted"),
+    }
+
+    if extra:
+        row.update(extra)
+
+    header = [
+        "round",
+        "global_test_loss",
+        "global_test_acc",
+        "precision_macro",
+        "recall_macro",
+        "f1_macro",
+        "precision_weighted",
+        "recall_weighted",
+        "f1_weighted",
+    ]
+
+    # include extra keys if provided
+    if extra:
+        for k in extra.keys():
+            if k not in header:
+                header.append(k)
+
+    _append_csv_row(csv_path, header, row)
 
 def generate_sampling_plan(
     num_clients: int,
@@ -427,235 +738,275 @@ def main(grid: Grid, context: Context) -> None:
     # ============================================================
     # [ADD] XGBoost branch: FedXgbBagging or FedXgbCyclic
     # ============================================================
+    # ============================================================
+    # [ADD] XGBoost branch: FedXgbBagging / FedXgbCyclic / FedXGBllr
+    # ============================================================
     if model_name == "xgboost":
-        if strategy_name not in ("fedxgbbagging", "fedxgbcyclic"):
-            raise ValueError(
-                "For model-name='xgboost', set strategy-name to "
-                "'fedxgbbagging' or 'fedxgbcyclic'"
+        # ------------------------------------------------------------
+        # Existing branches: Bagging / Cyclic
+        # ------------------------------------------------------------
+        if strategy_name in ("fedxgbbagging", "fedxgbcyclic"):
+            initial_arrays = ArrayRecord([np.frombuffer(b"", dtype=np.uint8)])
+            per_round_csv_path = out_dir / "global_test_per_round.csv"   # [ADD]
+
+            if strategy_name == "fedxgbbagging":
+                strategy = FedXgbBagging(
+                    fraction_train=fraction_train,
+                    fraction_evaluate=fraction_evaluate,
+                    min_train_nodes=num_clients,
+                    min_evaluate_nodes=num_clients,
+                    min_available_nodes=num_clients,
+                )
+            else:
+                strategy = FedXgbCyclic(
+                    fraction_train=fraction_train,
+                    fraction_evaluate=fraction_evaluate,
+                    min_available_nodes=num_clients,
+                )
+
+            # ------------------------------------------------------------
+            # [ADD] wrap server-side eval to also write per-round CSV
+            # ------------------------------------------------------------
+            def _xgb_eval_and_log(server_round, arrays):
+                metric_record = _server_side_xgb_eval(server_round, arrays, cfg, num_classes)
+                if metric_record is not None:
+                    _append_global_test_per_round_csv(
+                        csv_path=per_round_csv_path,
+                        server_round=int(server_round),
+                        metric_record=metric_record,
+                        extra={"strategy": strategy_name},
+                    )
+                return metric_record
+
+            t0 = time.perf_counter()
+            result = strategy.start(
+                grid=grid,
+                initial_arrays=initial_arrays,
+                train_config=ConfigRecord({}),
+                num_rounds=num_rounds,
+                evaluate_fn=(
+                    _xgb_eval_and_log if do_centralized_test else None
+                ),
+            )
+            t1 = time.perf_counter()
+
+            final_bytes = bytearray(result.arrays["0"].numpy().tobytes())
+            model_path = out_dir / f"final_model_{strategy_name}.json"
+
+            xgb = _require_xgboost()
+            bst = xgb.Booster(params=build_xgb_params_from_cfg(cfg, num_classes))
+            bst.load_model(final_bytes)
+            bst.save_model(str(model_path))
+
+            total_time = float(t1 - t0)
+            avg_round_time = total_time / max(num_rounds, 1)
+            model_bytes = len(final_bytes)
+            clients_per_round = max(1, int(round(fraction_train * num_clients)))
+            est_comm_per_round_mib = float((model_bytes * 2 * clients_per_round) / (1024.0 ** 2))
+
+            centralized = {}
+            if do_centralized_test:
+                metric_record = _server_side_xgb_eval(num_rounds, result.arrays, cfg, num_classes)
+                if metric_record is not None:
+                    centralized = dict(metric_record)
+
+            run_summary = {
+                "exp_id": exp_id,
+                "model": model_name,
+                "strategy": strategy_name,
+                "partition_mode": partition_mode,
+                "dirichlet_alpha": dirichlet_alpha if partition_mode == "dirichlet" else None,
+                "num_clients": num_clients,
+                "num_rounds": num_rounds,
+                "fraction_train": fraction_train,
+                "fraction_evaluate": fraction_evaluate,
+                "local_epochs": local_epochs,
+                "batch_size": batch_size,
+                "lr": None,
+                "num_features": num_features,
+                "num_classes": num_classes,
+                "total_time_s": total_time,
+                "avg_round_time_s": float(avg_round_time),
+                "server_test_time_total_s": None,
+                "avg_round_server_test_time_s": None,
+                "model_size_kib": float(model_bytes / 1024.0),
+                "est_comm_per_round_mib": est_comm_per_round_mib,
+                **centralized,
+                "final_model_path": str(model_path),
+            }
+
+            _save_json(out_dir / "run_summary.json", run_summary)
+
+            summary_path = out_root / "results_summary.csv"
+            header = [
+                "exp_id", "model", "strategy", "partition_mode", "dirichlet_alpha",
+                "num_clients", "num_rounds", "fraction_train", "fraction_evaluate", "local_epochs",
+                "batch_size", "lr", "num_features", "num_classes",
+                "total_time_s", "avg_round_time_s",
+                "server_test_time_total_s", "avg_round_server_test_time_s",
+                "model_size_kib", "est_comm_per_round_mib",
+                "global_test_loss", "global_test_acc",
+                "precision_macro", "recall_macro", "f1_macro",
+                "precision_weighted", "recall_weighted", "f1_weighted",
+                "final_model_path",
+            ]
+            for k in header:
+                run_summary.setdefault(k, None)
+            _append_csv_row(summary_path, header, run_summary)
+
+            print(f"\n[OK] Saved: {out_dir}")
+            print(f"[OK] Updated: {summary_path}")
+            return
+
+        # ------------------------------------------------------------
+        # [ADD] New branch: FedXGBllr
+        # ------------------------------------------------------------
+        if strategy_name == "fedxgbllr":
+            sampling_plan_path = out_dir / "sampling_plan.json"
+            per_round_csv_path = out_dir / "global_test_per_round.csv"   # [ADD]
+
+            sampling_plan = generate_sampling_plan(
+                num_clients=num_clients,
+                fraction_train=fraction_train,
+                num_rounds=num_rounds,
+                out_path=sampling_plan_path,
             )
 
-        initial_arrays = ArrayRecord([np.frombuffer(b"", dtype=np.uint8)])
+            meta_model = build_xgbllr_meta_model(
+                num_models=num_clients,
+                num_classes=num_classes,
+            )
+            meta_initial_arrays = ArrayRecord(meta_model.state_dict())
 
-        if strategy_name == "fedxgbbagging":
-            strategy = FedXgbBagging(
+            strategy = ServerFedXGBllr(
+                sampling_plan=sampling_plan,
+                num_clients=num_clients,
+                local_xgb_rounds=local_epochs,   # round-1 XGB ensemble size
+                meta_initial_arrays=meta_initial_arrays,
                 fraction_train=fraction_train,
                 fraction_evaluate=fraction_evaluate,
                 min_train_nodes=num_clients,
-                min_evaluate_nodes=num_clients,
-                min_available_nodes=num_clients,
-            )
-        else:
-            # [ADD] FedXgbCyclic
-            strategy = FedXgbCyclic(
-                fraction_train=fraction_train,
-                fraction_evaluate=fraction_evaluate,
+                min_evaluate_nodes=max(1, int(round(fraction_evaluate * num_clients))),
                 min_available_nodes=num_clients,
             )
 
-        t0 = time.perf_counter()
-        result = strategy.start(
-            grid=grid,
-            initial_arrays=initial_arrays,
-            train_config=ConfigRecord({}),
-            num_rounds=num_rounds,
-            evaluate_fn=(
-                (lambda server_round, arrays: _server_side_xgb_eval(server_round, arrays, cfg, num_classes))
-                if do_centralized_test else None
-            ),
+            # ------------------------------------------------------------
+            # [ADD] wrap FedXGBllr server-side eval to also write per-round CSV
+            # ------------------------------------------------------------
+            def _xgbllr_eval_and_log(server_round, arrays):
+                if int(server_round) <= 1:
+                    return None
+
+                metric_record = _server_side_xgbllr_eval(
+                    server_round, arrays, cfg, num_classes, strategy.xgb_models_json
+                )
+                if metric_record is not None:
+                    _append_global_test_per_round_csv(
+                        csv_path=per_round_csv_path,
+                        server_round=int(server_round),
+                        metric_record=metric_record,
+                        extra={"strategy": strategy_name},
+                    )
+                return metric_record
+
+            t0 = time.perf_counter()
+            result = strategy.start(
+                grid=grid,
+                initial_arrays=ArrayRecord([np.frombuffer(b"", dtype=np.uint8)]),
+                train_config=ConfigRecord({
+                    "lr": lr,   # used by meta learner from round 2 onward
+                }),
+                num_rounds=num_rounds,
+                evaluate_fn=(
+                    _xgbllr_eval_and_log if do_centralized_test else None
+                ),
+            )
+            t1 = time.perf_counter()
+
+            # Save final meta learner
+            meta_state_dict = result.arrays.to_torch_state_dict()
+            meta_model_path = out_dir / "final_model_fedxgbllr_meta.pt"
+            torch.save(meta_state_dict, str(meta_model_path))
+
+            # Save frozen XGB ensemble collection
+            xgb_ensemble_path = out_dir / "fedxgbllr_frozen_ensembles.json"
+            xgb_ensemble_path.write_text(strategy.xgb_models_json, encoding="utf-8")
+
+            total_time = float(t1 - t0)
+            avg_round_time = total_time / max(num_rounds, 1)
+
+            meta_bytes = sum(
+                v.numel() * v.element_size()
+                for v in meta_state_dict.values()
+                if torch.is_tensor(v)
+            )
+
+            xgb_models_list = xgb_models_from_json(strategy.xgb_models_json)
+            xgb_bytes = sum(len(x) for x in xgb_models_list)
+
+            clients_per_round = max(1, int(round(fraction_train * num_clients)))
+            est_comm_per_round_mib = float((meta_bytes * 2 * clients_per_round) / (1024.0 ** 2))
+
+            centralized = {}
+            if do_centralized_test:
+                metric_record = _server_side_xgbllr_eval(
+                    num_rounds, result.arrays, cfg, num_classes, strategy.xgb_models_json
+                )
+                if metric_record is not None:
+                    centralized = dict(metric_record)
+
+            run_summary = {
+                "exp_id": exp_id,
+                "model": model_name,
+                "strategy": strategy_name,
+                "partition_mode": partition_mode,
+                "dirichlet_alpha": dirichlet_alpha if partition_mode == "dirichlet" else None,
+                "num_clients": num_clients,
+                "num_rounds": num_rounds,
+                "fraction_train": fraction_train,
+                "fraction_evaluate": fraction_evaluate,
+                "local_epochs": local_epochs,
+                "batch_size": batch_size,
+                "lr": lr,
+                "num_features": num_features,
+                "num_classes": num_classes,
+                "total_time_s": total_time,
+                "avg_round_time_s": float(avg_round_time),
+                "server_test_time_total_s": None,
+                "avg_round_server_test_time_s": None,
+                "model_size_kib": float((meta_bytes + xgb_bytes) / 1024.0),
+                "est_comm_per_round_mib": est_comm_per_round_mib,
+                **centralized,
+                "final_model_path": str(meta_model_path),
+                "round_train_loss": strategy.round_train_loss,
+                "round_wall_time_s": strategy.round_wall_time,
+            }
+
+            _save_json(out_dir / "run_summary.json", run_summary)
+
+            summary_path = out_root / "results_summary.csv"
+            header = [
+                "exp_id", "model", "strategy", "partition_mode", "dirichlet_alpha",
+                "num_clients", "num_rounds", "fraction_train", "fraction_evaluate", "local_epochs",
+                "batch_size", "lr", "num_features", "num_classes",
+                "total_time_s", "avg_round_time_s",
+                "server_test_time_total_s", "avg_round_server_test_time_s",
+                "model_size_kib", "est_comm_per_round_mib",
+                "global_test_loss", "global_test_acc",
+                "precision_macro", "recall_macro", "f1_macro",
+                "precision_weighted", "recall_weighted", "f1_weighted",
+                "final_model_path",
+            ]
+            for k in header:
+                run_summary.setdefault(k, None)
+            _append_csv_row(summary_path, header, run_summary)
+
+            print(f"\n[OK] Saved: {out_dir}")
+            print(f"[OK] Updated: {summary_path}")
+            print(f"[OK] FedXGBllr frozen ensembles: {xgb_ensemble_path}")
+            return
+
+        raise ValueError(
+            "For model-name='xgboost', strategy-name must be one of: "
+            "'fedxgbbagging', 'fedxgbcyclic', 'fedxgbllr'"
         )
-        t1 = time.perf_counter()
-
-        final_bytes = bytearray(result.arrays["0"].numpy().tobytes())
-        model_path = out_dir / "final_model_xgboost.json"
-
-        xgb = _require_xgboost()
-        bst = xgb.Booster(params=build_xgb_params_from_cfg(cfg, num_classes))
-        bst.load_model(final_bytes)
-        bst.save_model(str(model_path))
-
-        total_time = float(t1 - t0)
-        avg_round_time = total_time / max(num_rounds, 1)
-        model_bytes = len(final_bytes)
-        clients_per_round = max(1, int(round(fraction_train * num_clients)))
-        est_comm_per_round_mib = float((model_bytes * 2 * clients_per_round) / (1024.0 ** 2))
-
-        centralized = {}
-        if do_centralized_test:
-            metric_record = _server_side_xgb_eval(num_rounds, result.arrays, cfg, num_classes)
-            if metric_record is not None:
-                centralized = dict(metric_record)
-
-        run_summary = {
-            "exp_id": exp_id,
-            "model": model_name,
-            "strategy": strategy_name,
-            "partition_mode": partition_mode,
-            "dirichlet_alpha": dirichlet_alpha if partition_mode == "dirichlet" else None,
-            "num_clients": num_clients,
-            "num_rounds": num_rounds,
-            "fraction_train": fraction_train,
-            "fraction_evaluate": fraction_evaluate,
-            "local_epochs": local_epochs,
-            "batch_size": batch_size,
-            "lr": None,
-            "num_features": num_features,
-            "num_classes": num_classes,
-            "total_time_s": total_time,
-            "avg_round_time_s": float(avg_round_time),
-            "server_test_time_total_s": None,
-            "avg_round_server_test_time_s": None,
-            "model_size_kib": float(model_bytes / 1024.0),
-            "est_comm_per_round_mib": est_comm_per_round_mib,
-            **centralized,
-            "final_model_path": str(model_path),
-        }
-
-        _save_json(out_dir / "run_summary.json", run_summary)
-
-        summary_path = out_root / "results_summary.csv"
-        header = [
-            "exp_id", "model", "strategy", "partition_mode", "dirichlet_alpha",
-            "num_clients", "num_rounds", "fraction_train", "fraction_evaluate", "local_epochs",
-            "batch_size", "lr", "num_features", "num_classes",
-            "total_time_s", "avg_round_time_s",
-            "server_test_time_total_s", "avg_round_server_test_time_s",
-            "model_size_kib", "est_comm_per_round_mib",
-            "global_test_loss", "global_test_acc",
-            "precision_macro", "recall_macro", "f1_macro",
-            "precision_weighted", "recall_weighted", "f1_weighted",
-            "final_model_path",
-        ]
-        for k in header:
-            run_summary.setdefault(k, None)
-        _append_csv_row(summary_path, header, run_summary)
-
-        print(f"\n[OK] Saved: {out_dir}")
-        print(f"[OK] Updated: {summary_path}")
-        return
-
-    # ============================================================
-    # Existing PyTorch / FedProx branch
-    # ============================================================
-    sampling_plan_path = out_dir / "sampling_plan.json"
-
-    sampling_plan = generate_sampling_plan(
-        num_clients=num_clients,
-        fraction_train=fraction_train,
-        num_rounds=num_rounds,
-        out_path=sampling_plan_path,
-    )
-
-    global_model = build_model(model_name, num_features, num_classes)
-    initial_arrays = ArrayRecord(global_model.state_dict())
-
-    strategy = ServerTestFedProx(
-        sampling_plan=sampling_plan,
-        fraction_train=1.0,
-        fraction_evaluate=1.0,
-        min_train_nodes=num_clients,
-        min_evaluate_nodes=1,
-        min_available_nodes=num_clients,
-        proximal_mu=0.01,
-        model_name=model_name,
-        num_features=num_features,
-        num_classes=num_classes,
-        batch_size=batch_size,
-        test_csv_path=server_test_csv,
-        output_dir=str(out_dir),
-        initial_arrays=initial_arrays,
-    )
-
-    t0 = time.perf_counter()
-    result = strategy.start(
-        grid=grid,
-        initial_arrays=initial_arrays,
-        train_config=ConfigRecord({
-            "lr": lr,
-            "proximal_mu": 0.01,
-        }),
-        num_rounds=num_rounds,
-    )
-    t1 = time.perf_counter()
-
-    state_dict = result.arrays.to_torch_state_dict()
-    model_path = out_dir / f"final_model_{model_name}.pt"
-    torch.save(state_dict, str(model_path))
-
-    total_time = float(t1 - t0)
-    effective_rounds = max(num_rounds - 1, 1)
-    avg_round_time = total_time / effective_rounds
-    server_test_time_total_s = float(getattr(strategy, "server_test_time_total_s", 0.0))
-    avg_round_server_test_time_s = server_test_time_total_s / max(num_rounds, 1)
-    model_bytes = sum(v.numel() * v.element_size() for v in state_dict.values() if torch.is_tensor(v))
-    clients_per_round = max(1, int(round(fraction_train * num_clients)))
-    est_comm_per_round_mib = float((model_bytes * 2 * clients_per_round) / (1024.0 ** 2))
-
-    centralized = {}
-    if do_centralized_test:
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        model = build_model(model_name, num_features, num_classes).to(device)
-        model.load_state_dict(state_dict)
-
-        testloader = load_centralized_testloader(server_test_csv, batch_size=batch_size)
-        loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = test_fn(
-            model, testloader, device, num_classes=num_classes, criterion=None
-        )
-        centralized = {
-            "global_test_loss": float(loss),
-            "global_test_acc": float(acc),
-            "precision_macro": float(p_macro),
-            "recall_macro": float(r_macro),
-            "f1_macro": float(f1_macro),
-            "precision_weighted": float(p_w),
-            "recall_weighted": float(r_w),
-            "f1_weighted": float(f1_w),
-        }
-
-    run_summary = {
-        "exp_id": exp_id,
-        "model": model_name,
-        "strategy": strategy_name,
-        "partition_mode": partition_mode,
-        "dirichlet_alpha": dirichlet_alpha if partition_mode == "dirichlet" else None,
-        "num_clients": num_clients,
-        "num_rounds": num_rounds,
-        "fraction_train": fraction_train,
-        "fraction_evaluate": fraction_evaluate,
-        "local_epochs": local_epochs,
-        "batch_size": batch_size,
-        "lr": lr,
-        "num_features": num_features,
-        "num_classes": num_classes,
-        "total_time_s": total_time,
-        "avg_round_time_s": float(avg_round_time),
-        "server_test_time_total_s": float(server_test_time_total_s),
-        "avg_round_server_test_time_s": float(avg_round_server_test_time_s),
-        "model_size_kib": float(model_bytes / 1024.0),
-        "est_comm_per_round_mib": est_comm_per_round_mib,
-        **centralized,
-        "final_model_path": str(model_path),
-    }
-
-    run_summary["round_train_loss"] = strategy.round_train_loss
-    run_summary["round_wall_time_s"] = strategy.round_wall_time
-    _save_json(out_dir / "run_summary.json", run_summary)
-
-    summary_path = out_root / "results_summary.csv"
-    header = [
-        "exp_id", "model", "strategy", "partition_mode", "dirichlet_alpha",
-        "num_clients", "num_rounds", "fraction_train", "fraction_evaluate", "local_epochs",
-        "batch_size", "lr", "num_features", "num_classes",
-        "total_time_s", "avg_round_time_s", "server_test_time_total_s",
-        "avg_round_server_test_time_s",
-        "model_size_kib", "est_comm_per_round_mib",
-        "global_test_loss", "global_test_acc",
-        "precision_macro", "recall_macro", "f1_macro",
-        "precision_weighted", "recall_weighted", "f1_weighted",
-        "final_model_path",
-    ]
-    for k in header:
-        run_summary.setdefault(k, None)
-    _append_csv_row(summary_path, header, run_summary)
-
-    print(f"\n[OK] Saved: {out_dir}")
-    print(f"[OK] Updated: {summary_path}")

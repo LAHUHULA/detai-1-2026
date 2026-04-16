@@ -35,7 +35,7 @@ clientapp = "ddos_attack.client_app:app"
 
 # Custom config values accessible via `context.run_config`
 [tool.flwr.app.config]
-exp-id = "exp_lr_fedxgbcyclic_0.1_N2_fedprox-0.01_test"
+exp-id = "exp_lr_fedxgbllr_0.1_N2_fedprox-0.01_test"
 num-server-rounds = 5
 num-clients = 2
 fraction-train = 1
@@ -46,7 +46,7 @@ batch-size = 256
 
 # ===== model / strategy / partition =====
 model-name = "xgboost"                 # "mlp" | "logistic" | "tab-res-net" | "xgboost"
-strategy-name = "fedxgbcyclic"        # "fedavg" | "fedprox" | "fedxgbbagging" | "fedxgbcyclic"
+strategy-name = "fedxgbllr"        # "fedavg" | "fedprox" | "fedxgbbagging" | "fedxgbcyclic" | "fedxgbllr"
 partition-mode = "dirichlet"           # "iid" | "dirichlet"
 dirichlet-alpha = 0.1
 
