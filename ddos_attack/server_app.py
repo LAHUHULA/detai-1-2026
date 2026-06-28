@@ -11,6 +11,8 @@ import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord  # [ADD MetricRecord]
 from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import FedAvg, FedAvgM, FedProx, FedXgbBagging, FedXgbCyclic
+import lightgbm as lgb
+from ddos_attack.task import lgb_evaluate_bytes
 
 from ddos_attack.task import (
     build_model,
@@ -87,6 +89,55 @@ def _server_side_xgb_eval(server_round: int, arrays: ArrayRecord, cfg: dict, num
         })
     except Exception as e:
         print(f"[WARN] Round {server_round}: server-side XGBoost eval skipped due to error: {e}")
+        return None
+    
+# ============================================================
+# [ADD] LightGBM branch
+# ============================================================
+
+def _server_side_lgb_eval(
+    server_round: int,
+    arrays: ArrayRecord,
+    cfg: dict,
+    num_classes: int,
+):
+    if "0" not in arrays:
+        print(f"[WARN] Round {server_round}: no LightGBM arrays found, skip server eval.")
+        return None
+
+    model_bytes = bytearray(arrays["0"].numpy().tobytes())
+    if len(model_bytes) == 0:
+        print(f"[WARN] Round {server_round}: empty LightGBM model, skip server eval.")
+        return None
+
+    test_csv = str(cfg.get("server-test-csv", "")).strip()
+    if not test_csv:
+        print(f"[WARN] Round {server_round}: no server-test-csv configured, skip server eval.")
+        return None
+
+    try:
+        X_test, y_test = load_centralized_test_numpy(test_csv)
+        model = lgb.Booster(model_file=bytearray(model_bytes))
+        loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = lgb_evaluate_bytes(
+            model=model,
+            X=X_test,
+            y=y_test,
+            cfg=cfg,
+            num_classes=num_classes,
+        )
+
+        return MetricRecord({
+            "global_test_loss": float(loss),
+            "global_test_acc": float(acc),
+            "precision_macro": float(p_macro),
+            "recall_macro": float(r_macro),
+            "f1_macro": float(f1_macro),
+            "precision_weighted": float(p_w),
+            "recall_weighted": float(r_w),
+            "f1_weighted": float(f1_w),
+        })
+    except Exception as e:
+        print(f"[WARN] Round {server_round}: LightGBM evaluation skipped due to error: {e}")
         return None
     
 # ============================================================
@@ -717,6 +768,7 @@ def main(grid: Grid, context: Context) -> None:
     fraction_train = float(cfg["fraction-train"])
     fraction_evaluate = float(cfg.get("fraction-evaluate", 1.0))
     lr = float(cfg.get("lr", 1e-3))
+    proximal_mu = float(cfg.get("proximal-mu", cfg.get("proximal_mu", 0.01)))   # [ADD]
     local_epochs = int(cfg["local-epochs"])
     batch_size = int(cfg.get("batch-size", 256))
 
@@ -734,6 +786,154 @@ def main(grid: Grid, context: Context) -> None:
     server_test_csv = str(cfg.get("server-test-csv", ""))
 
     _save_json(out_dir / "run_config.json", dict(cfg))
+
+    # ============================================================
+    # [ADD] CNN branch: FedAvg / FedProx
+    # ============================================================
+        # ============================================================
+    # [ADD] PyTorch branch restored: FedAvg / FedProx
+    # Supports: logistic / mlp / tab-res-net
+    # ============================================================
+    if model_name in ("logistic", "mlp", "tab-res-net", "tab_res_net", "tabresnet"):
+        if strategy_name not in ("fedavg", "fedprox"):
+            raise ValueError(
+                "For PyTorch models ('logistic', 'mlp', 'tab-res-net'), "
+                "strategy-name must be 'fedavg' or 'fedprox'"
+            )
+
+        sampling_plan_path = out_dir / "sampling_plan.json"
+
+        sampling_plan = generate_sampling_plan(
+            num_clients=num_clients,
+            fraction_train=fraction_train,
+            num_rounds=num_rounds,
+            out_path=sampling_plan_path,
+        )
+
+        global_model = build_model(model_name, num_features, num_classes)
+        initial_arrays = ArrayRecord(global_model.state_dict())
+
+        # [ADD] FedAvg is implemented by FedProx with proximal_mu = 0.0
+        effective_prox_mu = 0.0 if strategy_name == "fedavg" else float(proximal_mu)
+
+        strategy = ServerTestFedProx(
+            sampling_plan=sampling_plan,
+            fraction_train=1.0,
+            fraction_evaluate=1.0,
+            min_train_nodes=num_clients,
+            min_evaluate_nodes=1,
+            min_available_nodes=num_clients,
+            proximal_mu=effective_prox_mu,
+            model_name=model_name,
+            num_features=num_features,
+            num_classes=num_classes,
+            batch_size=batch_size,
+            test_csv_path=server_test_csv,
+            output_dir=str(out_dir),
+            initial_arrays=initial_arrays,
+        )
+
+        t0 = time.perf_counter()
+        result = strategy.start(
+            grid=grid,
+            initial_arrays=initial_arrays,
+            train_config=ConfigRecord({
+                "lr": lr,
+                "proximal_mu": effective_prox_mu,
+            }),
+            num_rounds=num_rounds,
+        )
+        t1 = time.perf_counter()
+
+        state_dict = result.arrays.to_torch_state_dict()
+        model_path = out_dir / f"final_model_{model_name}.pt"
+        torch.save(state_dict, str(model_path))
+
+        total_time = float(t1 - t0)
+        effective_rounds = max(num_rounds - 1, 1)
+        avg_round_time = total_time / effective_rounds
+        server_test_time_total_s = float(getattr(strategy, "server_test_time_total_s", 0.0))
+        avg_round_server_test_time_s = server_test_time_total_s / max(num_rounds, 1)
+
+        model_bytes = sum(
+            v.numel() * v.element_size()
+            for v in state_dict.values()
+            if torch.is_tensor(v)
+        )
+        clients_per_round = max(1, int(round(fraction_train * num_clients)))
+        est_comm_per_round_mib = float((model_bytes * 2 * clients_per_round) / (1024.0 ** 2))
+
+        centralized = {}
+        if do_centralized_test:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            model = build_model(model_name, num_features, num_classes).to(device)
+            model.load_state_dict(state_dict)
+
+            testloader = load_centralized_testloader(server_test_csv, batch_size=batch_size)
+            loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = test_fn(
+                model, testloader, device, num_classes=num_classes, criterion=None
+            )
+            centralized = {
+                "global_test_loss": float(loss),
+                "global_test_acc": float(acc),
+                "precision_macro": float(p_macro),
+                "recall_macro": float(r_macro),
+                "f1_macro": float(f1_macro),
+                "precision_weighted": float(p_w),
+                "recall_weighted": float(r_w),
+                "f1_weighted": float(f1_w),
+            }
+
+        run_summary = {
+            "exp_id": exp_id,
+            "model": model_name,
+            "strategy": strategy_name,
+            "partition_mode": partition_mode,
+            "dirichlet_alpha": dirichlet_alpha if partition_mode == "dirichlet" else None,
+            "num_clients": num_clients,
+            "num_rounds": num_rounds,
+            "fraction_train": fraction_train,
+            "fraction_evaluate": fraction_evaluate,
+            "local_epochs": local_epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "proximal_mu": effective_prox_mu,   # [ADD]
+            "num_features": num_features,
+            "num_classes": num_classes,
+            "total_time_s": total_time,
+            "avg_round_time_s": float(avg_round_time),
+            "server_test_time_total_s": float(server_test_time_total_s),
+            "avg_round_server_test_time_s": float(avg_round_server_test_time_s),
+            "model_size_kib": float(model_bytes / 1024.0),
+            "est_comm_per_round_mib": est_comm_per_round_mib,
+            **centralized,
+            "final_model_path": str(model_path),
+            "round_train_loss": getattr(strategy, "round_train_loss", {}),
+            "round_wall_time_s": getattr(strategy, "round_wall_time", {}),
+        }
+
+        _save_json(out_dir / "run_summary.json", run_summary)
+
+        summary_path = out_root / "results_summary.csv"
+        header = [
+            "exp_id", "model", "strategy", "partition_mode", "dirichlet_alpha",
+            "num_clients", "num_rounds", "fraction_train", "fraction_evaluate", "local_epochs",
+            "batch_size", "lr", "proximal_mu", "num_features", "num_classes",
+            "total_time_s", "avg_round_time_s", "server_test_time_total_s",
+            "avg_round_server_test_time_s",
+            "model_size_kib", "est_comm_per_round_mib",
+            "global_test_loss", "global_test_acc",
+            "precision_macro", "recall_macro", "f1_macro",
+            "precision_weighted", "recall_weighted", "f1_weighted",
+            "final_model_path",
+        ]
+        for k in header:
+            run_summary.setdefault(k, None)
+        _append_csv_row(summary_path, header, run_summary)
+
+        print(f"\n[OK] Saved: {out_dir}")
+        print(f"[OK] Updated: {summary_path}")
+        return
 
     # ============================================================
     # [ADD] XGBoost branch: FedXgbBagging or FedXgbCyclic

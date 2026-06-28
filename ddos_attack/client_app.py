@@ -16,6 +16,8 @@ from ddos_attack.task import (
     train_xgbllr_meta,                # [ADD]
     test_xgbllr_meta,                 # [ADD]
     compute_class_weights_from_labels, # [ADD]
+    lgb_train_one_client,
+    lgb_evaluate_bytes,
     train as train_fn,
     test as test_fn,
     get_num_features_classes_from_local_csv,
@@ -62,6 +64,98 @@ def train(msg: Message, context: Context):
     cpu0, ram0 = get_cpu_ram_percent()
     temp0 = _try_read_pi_temp_c()
     tx0, rx0 = get_net_bytes()
+
+    # ============================================================
+    # [ADD] LightGBM branch
+    # ============================================================
+
+    if model_name == "lightgbm":
+        strategy_name = str(_k(cfg, "strategy-name", "fedxgbbagging")).lower().strip()
+
+        X_train, y_train, _, _ = load_data_numpy(
+            partition_id=partition_id,
+            num_partitions=num_partitions,
+            mode=partition_mode,
+            dirichlet_alpha=dirichlet_alpha,
+            data_root=data_root,
+        )
+
+        global_model_bytes = b""
+        if "arrays" in msg.content and "0" in msg.content["arrays"]:
+            global_model_bytes = bytearray(msg.content["arrays"]["0"].numpy().tobytes())
+
+        # ------------------------------------------------------------
+        # [ADD] LightGBM branch
+        # ------------------------------------------------------------
+        if strategy_name == "fedxgbbagging":
+            local_model_bytes = lgb_train_one_client(
+                global_model_bytes=global_model_bytes,
+                X_train=X_train,
+                y_train=y_train,
+                cfg=cfg,
+                num_classes=num_classes,
+                num_local_round=local_epochs,
+            )
+        elif strategy_name == "fedxgbcyclic":
+            local_model_bytes = xgb_train_one_client_cyclic(
+                global_model_bytes=global_model_bytes,
+                X_train=X_train,
+                y_train=y_train,
+                cfg=cfg,
+                num_classes=num_classes,
+                num_local_round=local_epochs,
+            )
+        elif strategy_name == "fedlgb":
+            local_model_bytes = lgb_train_one_client(  # [ADD] LightGBM
+                global_model_bytes=global_model_bytes,
+                X_train=X_train,
+                y_train=y_train,
+                cfg=cfg,
+                num_classes=num_classes,
+                num_local_round=local_epochs,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported strategy-name='{strategy_name}' for model-name='{model_name}'. "
+                f"Use 'fedxgbbagging', 'fedxgbcyclic', or 'fedlgb'."
+            )
+
+        t1 = time.perf_counter()
+        monitor.stop()
+        resource_stats = monitor.summary()
+
+        cpu1, ram1 = get_cpu_ram_percent()
+        temp1 = _try_read_pi_temp_c()
+        tx1, rx1 = get_net_bytes()
+
+        log_round({
+            "exp_id": str(_k(cfg, "exp-id", "")),
+            "client_id": partition_id,
+            "model": model_name,
+            "mode": partition_mode,
+            "alpha": dirichlet_alpha if partition_mode == "dirichlet" else None,
+            "local_epochs": local_epochs,
+            "batch_size": batch_size,
+            "lr": None,
+            "local_samples": int(len(y_train)),
+            "train_time_s": float(t1 - t0),
+            **resource_stats,
+            "net_tx_bytes_delta": (tx1 - tx0) if (tx0 >= 0 and tx1 >= 0) else None,
+            "net_rx_bytes_delta": (rx1 - rx0) if (rx0 >= 0 and rx1 >= 0) else None,
+            "param_count": None,
+            "model_size_kib": float(len(local_model_bytes) / 1024.0),
+        })
+
+        model_np = np.frombuffer(local_model_bytes, dtype=np.uint8)
+        model_record = ArrayRecord([model_np])
+
+        metrics = {
+            "train_loss": 0.0,
+            "num-examples": int(len(y_train)),
+            "partition-id": int(partition_id),
+        }
+        content = RecordDict({"arrays": model_record, "metrics": MetricRecord(metrics)})
+        return Message(content=content, reply_to=msg)
 
     # ============================================================
     # [ADD] XGBoost branch
@@ -375,8 +469,104 @@ def evaluate(msg: Message, context: Context):
     )
 
     # ============================================================
-    # [ADD] XGBoost branch
+    # [ADD] LightGBM branch
     # ============================================================
+    if model_name == "lightgbm":
+        strategy_name = str(_k(cfg, "strategy-name", "fedxgbbagging")).lower().strip()
+
+        _, _, X_val, y_val = load_data_numpy(
+            partition_id=partition_id,
+            num_partitions=num_partitions,
+            mode=partition_mode,
+            dirichlet_alpha=dirichlet_alpha,
+            data_root=data_root,
+        )
+
+        global_model_bytes = b""
+        if "arrays" in msg.content and "0" in msg.content["arrays"]:
+            global_model_bytes = bytearray(msg.content["arrays"]["0"].numpy().tobytes())
+
+        # ------------------------------------------------------------
+        # [ADD] LightGBM evaluation branch
+        # ------------------------------------------------------------
+        if strategy_name == "fedxgbllr":
+            phase = str(msg.content["config"].get("phase", "eval_meta_xgbllr"))
+            if phase != "eval_meta_xgbllr":
+                raise ValueError(f"Unknown FedXGBllr eval phase='{phase}'")
+
+            xgb_models_json = str(msg.content["config"]["xgb_models_json"])
+            xgb_model_list = xgb_models_from_json(xgb_models_json)
+
+            meta_features = build_xgbllr_features_from_models(
+                xgb_model_list, X_val, cfg, num_classes
+            )
+
+            meta_model = build_xgbllr_meta_model(
+                num_models=len(xgb_model_list),
+                num_classes=num_classes,
+            )
+            meta_model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
+
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            meta_model.to(device)
+
+            eval_loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = test_xgbllr_meta(
+                model=meta_model,
+                features_np=meta_features,
+                labels_np=y_val,
+                batch_size=batch_size,
+                device=device,
+                num_classes=num_classes,
+            )
+
+            metrics = {
+                "eval_loss": float(eval_loss),
+                "eval_acc": float(acc),
+                "precision_macro": float(p_macro),
+                "recall_macro": float(r_macro),
+                "f1_macro": float(f1_macro),
+                "precision_weighted": float(p_w),
+                "recall_weighted": float(r_w),
+                "f1_weighted": float(f1_w),
+                "num-examples": int(len(y_val)),
+            }
+
+            content = RecordDict({"metrics": MetricRecord(metrics)})
+            return Message(content=content, reply_to=msg)
+
+        # ------------------------------------------------------------
+        # [ADD] FedLGB evaluation branch
+        # ------------------------------------------------------------
+        local_model_bytes = global_model_bytes
+        model = lgb.Booster(model_file=bytearray(local_model_bytes))
+
+        eval_loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = lgb_evaluate_bytes(
+            model=model,
+            X=X_val,
+            y=y_val,
+            cfg=cfg,
+            num_classes=num_classes,
+        )
+
+        metrics = {
+            "eval_loss": float(eval_loss),
+            "eval_acc": float(acc),
+            "precision_macro": float(p_macro),
+            "recall_macro": float(r_macro),
+            "f1_macro": float(f1_macro),
+            "precision_weighted": float(p_w),
+            "recall_weighted": float(r_w),
+            "f1_weighted": float(f1_w),
+            "num-examples": int(len(y_val)),
+        }
+
+        content = RecordDict({"metrics": MetricRecord(metrics)})
+        return Message(content=content, reply_to=msg)
+    
+# ============================================================
+# [ADD] XGBoost branch
+# ============================================================
+
     if model_name == "xgboost":
         strategy_name = str(_k(cfg, "strategy-name", "fedxgbbagging")).lower().strip()
 

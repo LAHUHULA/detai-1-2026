@@ -19,6 +19,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from typing import Tuple, Dict, Any
+import lightgbm as lgb
+from sklearn.metrics import log_loss, accuracy_score, precision_recall_fscore_support
 
 
 # ============================================================
@@ -444,6 +446,36 @@ def build_xgb_params_from_cfg(cfg: dict, num_classes: int) -> Dict[str, Any]:
     return params
 
 
+def lgb_train_one_client(
+    global_model_bytes: bytes | bytearray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    cfg: dict,
+    num_classes: int,
+    num_local_round: int,
+) -> bytes:
+    """
+    Train local LightGBM model and return the model (in raw format).
+    """
+    params = build_xgb_params_from_cfg(cfg, num_classes)
+    dtrain = lgb.Dataset(X_train, label=y_train)
+
+    # Round 1, initial model (empty)
+    if global_model_bytes is None or len(global_model_bytes) == 0:
+        model = lgb.train(
+            params=params,
+            train_set=dtrain,
+            num_boost_round=num_local_round,
+        )
+        return model.save_binary()
+
+    # Continue training from the received global model
+    model = lgb.Booster(model_file=bytearray(global_model_bytes))
+    model.update(dtrain, num_local_round)
+
+    return model.save_binary()
+
+
 def xgb_train_one_client(
     global_model_bytes: bytes | bytearray,
     X_train: np.ndarray,
@@ -596,6 +628,30 @@ def xgb_evaluate_bytes(
     acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w = multiclass_metrics(
         y_true_t, y_pred_t, num_classes
     )
+    return loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w
+
+def lgb_evaluate_bytes(
+    model: lgb.Booster,
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: dict,
+    num_classes: int,
+) -> tuple[float, float, float, float, float, float, float, float]:
+    """
+    Evaluate a trained LightGBM model.
+    Returns loss, accuracy, precision, recall, F1 score (macro & weighted).
+    """
+    y_pred = model.predict(X)
+    y_pred_class = np.argmax(y_pred, axis=1)
+
+    # Calculate loss (log loss)
+    loss = log_loss(y, y_pred)
+
+    # Calculate metrics (macro and weighted)
+    acc = accuracy_score(y, y_pred_class)
+    p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(y, y_pred_class, average='macro')
+    p_w, r_w, f1_w, _ = precision_recall_fscore_support(y, y_pred_class, average='weighted')
+
     return loss, acc, p_macro, r_macro, f1_macro, p_w, r_w, f1_w
 
 # ============================================================
